@@ -4,7 +4,7 @@ Delete a file or directory from a btrfs subvolume **and from every snapshot of
 it**, e.g. to get rid of a large file that btrbk snapshots would otherwise keep
 around for weeks.
 
-Single Python file, stdlib only (Python >= 3.11). It talks to btrfs through
+Single Python file, stdlib only (Python >= 3.12). It talks to btrfs through
 ioctls, so it doesn't even need btrfs-progs (the tests do).
 
 > [!WARNING]
@@ -78,7 +78,7 @@ btrfs-purge.py [-n] [-y] [-s DIR]... [--btrbk-conf FILE] [--snapshots-only] PATH
 | `-y`, `--yes` | don't ask for confirmation |
 | `-s DIR` | additional snapshot directory; repeatable |
 | `--btrbk-conf FILE` | btrbk config to read snapshot dirs from (default `/etc/btrbk/btrbk.conf`, ignored if missing) |
-| `--snapshots-only` | leave the live filesystem alone |
+| `--snapshots-only` | leave the live filesystem alone: only read-only snapshots are touched. A `PATH` inside a writable subvolume that merely sits in a snapshot directory is refused, since it may be a live subvolume |
 
 Deleting needs root (btrbk snapshots are owned by root). A dry run works as a
 normal user; anything you can't read is reported as `permission denied`
@@ -153,7 +153,9 @@ Delete? [y/N]
   start and again right after you confirm.
 - Resolves `PATH` like the kernel does: symlinks before `..`, so
   `link/../x` means the `x` next to the link's *target*, and `missing/../x`
-  is an error, not `x`. Only the last component may be missing.
+  or `file/../x` is an error, not `x`. The kernel resolves the parent first,
+  and the canonical path must name the same directory, so this doesn't depend
+  on the Python version. Only the last component may be missing.
 - Works on file descriptors, not paths: each subvolume root is opened once
   and verified by UUID to still be the planned subvolume, the read-only flag
   is toggled on that descriptor (ioctl), and deletion walks from it with
@@ -163,6 +165,13 @@ Delete? [y/N]
   instead of escaping, and the read-only flag still reaches the right
   snapshot. Recursive deletion never descends into another subvolume, even
   one created after the preview.
+- A snapshot's read-only state is checked again, through the verified
+  descriptor, right before its turn: if it changed since the preview (e.g.
+  someone made it writable), it is not touched.
+- If making a snapshot read-only again can't be verified, that is reported
+  as a failure (`!!! FAILED …` with its UUID and where it is now), never as
+  `gone`: a vanished path doesn't prove the snapshot was deleted. A snapshot
+  renamed during the run is found by UUID and restored under its new name.
 - Deletes only what the preview showed: each target's inode number and type
   are recorded when planning and must still match when deleting. A file
   replaced by another file or a directory in the meantime is left alone and

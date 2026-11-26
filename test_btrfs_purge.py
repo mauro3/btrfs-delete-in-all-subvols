@@ -502,7 +502,7 @@ class PurgeTest(unittest.TestCase):
         self.snapshot("s1")
         r = self.run_purge("-y", "-s", "snaps", "live/me/vm/missing/../big.img", ok=False)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("does not exist", r.stderr)
+        self.assertIn("No such file or directory", r.stderr)
         self.assertTrue(self.exists("live/me/vm/big.img"))
         self.assertTrue(self.exists("snaps/s1/me/vm/big.img"))
 
@@ -559,13 +559,141 @@ class PurgeTest(unittest.TestCase):
 
         bp.Subvol, bp.remove_at = flaky_subvol, remove
         try:
-            with self.assertRaises(OSError), \
-                    contextlib.redirect_stderr(io.StringIO()):
+            # The fd-based check fails; the path-based fallback restores and
+            # verifies ro, so this succeeds.
+            with contextlib.redirect_stderr(io.StringIO()):
                 bp.delete_in(s, "me/vm/big.img", None)
         finally:
             bp.Subvol, bp.remove_at = real_subvol, real_remove
         self.assertTrue(deleted)
         self.assertTrue(bp.Subvol(s.path).readonly)
+
+    # --- review round: kernel-validated paths, ro state, restore failures ---
+
+    def test_file_then_dotdot_refused(self):
+        # existing-file/../victim: the kernel says ENOTDIR.
+        self.snapshot("s1")
+        r = self.run_purge("-y", "-s", "snaps", "live/me/keep.txt/../vm/big.img", ok=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(self.exists("live/me/vm/big.img"))
+
+    def test_lexical_realpath_cannot_redirect(self):
+        # Simulate an older Python whose realpath applies '..' after a
+        # non-directory: the kernel check must still refuse.
+        real = os.path.realpath
+        os.path.realpath = lambda p, strict=False: os.path.normpath(p)
+        try:
+            with self.assertRaises(bp.PlanError):
+                bp.resolve_arg(self.p("live/me/keep.txt/../vm/big.img"))
+            with self.assertRaises(bp.PlanError):
+                bp.resolve_arg(self.p("live/me/missing/../vm/big.img"))
+            # Kernel accepts link/../vm (link -> live/other/sub, so it is
+            # live/other/vm); a lexical resolver says live/me/vm. Refuse.
+            os.makedirs(self.p("live/other/sub"))
+            os.makedirs(self.p("live/other/vm"))
+            os.symlink("../other/sub", self.p("live/me/link"))
+            with self.assertRaisesRegex(bp.PlanError, "resolve consistently"):
+                bp.resolve_arg(self.p("live/me/link/../vm/big.img"))
+        finally:
+            os.path.realpath = real
+
+    def test_snapshots_only_refuses_writable_location_guess(self):
+        # The reviewer's case: an unmounted, manually restored live subvolume
+        # inside a directory passed via -s.
+        self.snapshot("s1")
+        btrfs("subvolume", "snapshot", self.p("snaps/s1"), self.p("snaps/restored"))
+        self.snapshot("restored.1", src="snaps/restored")
+        r = self.run_purge("-y", "--snapshots-only", "-s", "snaps",
+                           "snaps/restored/me/vm/big.img", ok=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--snapshots-only", r.stderr)
+        self.assertTrue(self.exists("snaps/restored/me/vm/big.img"))
+
+    def test_snapshots_only_never_touches_writable(self):
+        btrfs("subvolume", "snapshot", self.live, self.p("snaps/rw"))
+        self.snapshot("s1")
+        r = self.run_purge("-y", "--snapshots-only", "-s", "snaps", "live/me/vm/big.img")
+        self.assertTrue(self.exists("live/me/vm/big.img"))
+        self.assertTrue(self.exists("snaps/rw/me/vm/big.img"))
+        self.assertFalse(self.exists("snaps/s1/me/vm/big.img"))
+
+    def test_location_guess_warns(self):
+        self.snapshot("s1")
+        btrfs("subvolume", "snapshot", self.live, self.p("snaps/rw"))
+        r = self.run_purge("-n", "-s", "snaps", "snaps/rw/me/vm/big.img")
+        self.assertIn("treating writable", r.stderr)
+
+    def test_snapshot_made_writable_before_its_turn_not_touched(self):
+        self.snapshot("s1")
+
+        def make_writable(n, root_fd, rel):
+            if n == 0:  # live copy; s1 is next
+                bp.set_ro(self.p("snaps/s1"), False)
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=make_writable)
+        self.assertIn("unlike in the preview", err)
+        self.assertNotEqual(code, 0)
+        self.assertTrue(self.exists("snaps/s1/me/vm/big.img"))
+
+    def failing_restore(self, times):
+        """Make the next `times` set-read-only ioctls fail."""
+        real_set, left = bp.set_ro_fd, [times]
+
+        def flaky(fd, value):
+            if value and left[0] > 0:
+                left[0] -= 1
+                raise OSError("injected restore failure")
+            real_set(fd, value)
+
+        bp.set_ro_fd = flaky
+        self.addCleanup(setattr, bp, "set_ro_fd", real_set)
+
+    def test_restore_failure_after_rename_recovered_by_uuid(self):
+        self.snapshot("s1")
+
+        def rename(n, root_fd, rel):
+            if n == 1:  # s1 is writable now
+                os.rename(self.p("snaps/s1"), self.p("snaps/s1.moved"))
+                self.failing_restore(1)  # the fd ioctl fails; path fallback works
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=rename)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("renamed to", err)
+        self.assertTrue(bp.Subvol(self.p("snaps/s1.moved")).readonly)
+
+    def test_restore_failure_after_rename_is_reported(self):
+        # The reviewer's case: renamed while writable, restore ioctl fails.
+        self.snapshot("s1")
+
+        def rename(n, root_fd, rel):
+            if n == 1:
+                os.rename(self.p("snaps/s1"), self.p("snaps/s1.moved"))
+                self.failing_restore(99)
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=rename)
+        self.assertNotEqual(code, 0)
+        self.assertIn("!!! FAILED", err)
+        self.assertIn("s1.moved", err)  # tells where it is now
+        self.assertNotIn("gone", out)
+
+    def test_restore_failure_when_not_found_fails_loudly(self):
+        self.snapshot("s1")
+        os.mkdir(self.p("elsewhere"))
+
+        def move_away(n, root_fd, rel):
+            if n == 1:
+                os.rename(self.p("snaps/s1"), self.p("elsewhere/s1"))
+                self.failing_restore(99)
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=move_away)
+        self.assertNotEqual(code, 0)
+        self.assertIn("!!! FAILED", err)
+        self.assertIn("not found under", err)
+        self.assertNotIn("gone", out)
 
     def test_btrbk_sources_parsing(self):
         conf = self.write_conf("volume /var\n  subvolume .\n  snapshot_dir .snapshots\n"

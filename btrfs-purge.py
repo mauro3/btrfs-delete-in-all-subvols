@@ -23,7 +23,7 @@ planning makes the deletion fail instead of escaping.
 If btrbk creates snapshots during the run, live copies are deleted first and a
 rescan at the end catches new snapshots that still contain the item.
 
-Needs Python >= 3.11, stdlib only; no btrfs-progs needed. Run as root.
+Needs Python >= 3.12, stdlib only; no btrfs-progs needed. Run as root.
 Default is to show the plan and ask. Use -n for dry run, -y to skip the prompt.
 """
 
@@ -39,8 +39,8 @@ import struct
 import sys
 import uuid as uuidlib
 
-if sys.version_info < (3, 11):
-    sys.exit("error: needs Python >= 3.11")
+if sys.version_info < (3, 12):
+    sys.exit("error: needs Python >= 3.12")
 
 BTRBK_CONF = "/etc/btrbk/btrbk.conf"
 BLOCKING_PROCS = {"borg", "borgmatic", "btrbk"}
@@ -66,7 +66,12 @@ class PlanError(Exception):
 
 
 class Gone(Exception):
-    """The snapshot disappeared during the run (e.g. btrbk rotation)."""
+    """The snapshot disappeared during the run (e.g. btrbk rotation), before
+    it was made writable."""
+
+
+class RestoreFailed(Exception):
+    """A snapshot could not be verified read-only again. Never downgraded."""
 
 
 class Subvol:
@@ -309,24 +314,34 @@ def resolve_arg(arg):
     name = os.path.basename(a)
     if name in (".", ".."):
         raise PlanError(f"refusing ambiguous path {arg!r}")
-    # strict: every component of the parent must exist, as for the kernel.
-    # (Non-strict realpath would turn missing/../x into x.)
+    # Let the kernel resolve the parent as given: it rejects missing/../x and
+    # file/../x. Then canonicalize, and check both name the same directory,
+    # since realpath (depending on the Python version) may apply '..' after a
+    # missing component or a non-directory instead of failing.
+    orig = os.path.dirname(a)
     try:
-        parent = os.path.realpath(os.path.dirname(a), strict=True)
+        kst = os.stat(orig)
+        if not stat.S_ISDIR(kst.st_mode):
+            raise NotADirectoryError(20, "Not a directory")
+        parent = os.path.realpath(orig, strict=True)
+        pst = os.stat(parent)
     except PermissionError:
-        raise PlanError(f"cannot access {os.path.dirname(a)}: permission denied (run as root)")
+        raise PlanError(f"cannot access {orig}: permission denied (run as root)")
     except OSError as e:
-        raise PlanError(f"parent directory {os.path.dirname(a)} does not exist "
-                        f"({e.strerror})")
+        raise PlanError(f"parent directory {orig} is not usable ({e.strerror})")
+    if (kst.st_dev, kst.st_ino) != (pst.st_dev, pst.st_ino):
+        raise PlanError(f"{orig} does not resolve consistently (got {parent}); refusing")
     return parent, name
 
 
 def is_snapshot(root, info, snapdirs, sources=()):
-    """Whether the subvolume at root is a snapshot rather than a live source."""
+    """Whether the subvolume at root is a snapshot rather than a live source:
+    False, "readonly" (certain), or "location" (a writable subvolume that
+    only looks like a snapshot because of where it is)."""
     if info.parent_uuid == NULL_UUID:
         return False
     if info.readonly:
-        return True
+        return "readonly"
     # Writable, but has a parent: a snapshot, or a live subvolume restored
     # from one. Configured btrbk sources and mounted subvolumes are live;
     # otherwise decide by location (in a snapshot dir -> snapshot).
@@ -336,10 +351,10 @@ def is_snapshot(root, info, snapdirs, sources=()):
         return False
     in_snapdir = lambda d: d in snapdirs or os.path.basename(d) == ".snapshots"
     d = os.path.dirname(root)
-    if in_snapdir(d):
-        return True
-    # snapper layout: <snapdir>/N/snapshot
-    return os.path.basename(root) == "snapshot" and in_snapdir(os.path.dirname(d))
+    if in_snapdir(d) or (os.path.basename(root) == "snapshot"  # snapper: N/snapshot
+                         and in_snapdir(os.path.dirname(d))):
+        return "location"
+    return False
 
 
 def plan(arg, snapdirs, include_live, sources=()):
@@ -360,6 +375,14 @@ def plan(arg, snapdirs, include_live, sources=()):
     rel = os.path.relpath(p, root)
     info = Subvol(root)
     in_snapshot = is_snapshot(root, info, known, sources)
+    if in_snapshot == "location":
+        if not include_live:
+            raise PlanError(
+                f"{root} is writable and only looks like a snapshot because of where "
+                "it is; it may be a live subvolume. With --snapshots-only, point PATH "
+                "into the live subvolume or a read-only snapshot instead.")
+        print(f"warning: treating writable {root} as a snapshot because it is in a "
+              "snapshot directory", file=sys.stderr)
     dirs = list(snapdirs)
 
     if in_snapshot:
@@ -383,7 +406,9 @@ def plan(arg, snapdirs, include_live, sources=()):
     # Writable subvolumes are only touched if they are the live source or the
     # one PATH names; other writable children of the source are likely
     # working clones, not snapshots.
-    rw_ok = {info.uuid} | ({subvols[0].uuid} if live else set())
+    # With --snapshots-only (include_live False), nothing writable is touched.
+    rw_ok = ({info.uuid} | ({subvols[0].uuid} if live else set())
+             if include_live else set())
     return (p, rel, live, in_snapshot, pin, len(subvols),
             list_targets(subvols, rel), rw_ok)
 
@@ -594,21 +619,59 @@ def remove_at(root_fd, rel, expect=None):
         os.close(fd)
 
 
+def _find_by_uuid(directory, uuid):
+    """Path of the subvolume with this uuid directly in directory, or None."""
+    try:
+        with os.scandir(directory) as it:
+            for e in it:
+                if is_subvol_root(e.path):
+                    try:
+                        if Subvol(e.path).uuid == uuid:
+                            return e.path
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    return None
+
+
 def _restore_ro(s, fd):
-    """Make the subvolume open as fd read-only again and verify it."""
+    """Make the subvolume open as fd read-only again and verify it. If that
+    fails, try the subvolume at its current path (found by uuid, in case it
+    was renamed). Anything not verified read-only raises RestoreFailed: a
+    vanished path is no proof the snapshot was deleted."""
     try:
         set_ro_fd(fd, True)
-        if not Subvol(s.path, fd).readonly:
-            raise OSError("still writable after setting ro")
-    except Exception as e:
-        if not os.path.lexists(s.path):
-            print(f"note: {s.path} disappeared while writable (btrbk rotation?)",
-                  file=sys.stderr)
+        if Subvol(s.path, fd).readonly:
             return
-        print(f"!!! FAILED to make {s.path} (uuid {s.uuid}) read-only again: {e}\n"
-              f"!!! fix manually: btrfs property set -ts {s.path} ro true",
-              file=sys.stderr)
-        raise
+        err = "still writable after setting ro"
+    except Exception as e:
+        err = e
+    where = s.path if _still_at_path(s) else _find_by_uuid(os.path.dirname(s.path), s.uuid)
+    if where:
+        try:
+            set_ro(where, True)
+            if Subvol(where).readonly and Subvol(where).uuid == s.uuid:
+                if where != s.path:
+                    print(f"note: {s.path} was renamed to {where} during the run; "
+                          "it is read-only again", file=sys.stderr)
+                return
+        except Exception as e2:
+            err = f"{err}; via path: {e2}"
+    hint = where or f"(not found under {os.path.dirname(s.path)}; deleted, or moved?)"
+    print(f"!!! FAILED to make snapshot uuid {s.uuid} read-only again: {err}\n"
+          f"!!! it was at {s.path}, now: {hint}\n"
+          "!!! if it still exists: btrfs property set -ts <its path> ro true",
+          file=sys.stderr)
+    raise RestoreFailed(f"could not verify read-only again: {err}")
+
+
+def _still_at_path(s):
+    """True if s.path still is the subvolume s (same uuid)."""
+    try:
+        return Subvol(s.path).uuid == s.uuid
+    except OSError:
+        return False
 
 
 def delete_in(s, rel, expect=None):
@@ -631,6 +694,9 @@ def delete_in(s, rel, expect=None):
             raise OSError(f"{s.path} is no longer the planned subvolume (uuid changed)")
         if cur.received_uuid != NULL_UUID:
             raise OSError(f"{s.path} is a received snapshot")
+        if cur.readonly != s.readonly:
+            raise OSError(f"{s.path} is {'read-only' if cur.readonly else 'writable'} "
+                          "now, unlike in the preview; not touched")
         try:
             if cur.readonly:
                 set_ro_fd(fd, False)
@@ -638,8 +704,12 @@ def delete_in(s, rel, expect=None):
         finally:
             if cur.readonly:
                 _restore_ro(s, fd)  # set first (idempotent), verify after
+    except (Gone, RestoreFailed):
+        raise
     except Exception as e:
-        if not isinstance(e, Gone) and not os.path.lexists(s.path):
+        # Only reachable if the snapshot was never left writable by us (any
+        # restore problem is a RestoreFailed above).
+        if not os.path.lexists(s.path):
             raise Gone(s.path) from e
         raise
     finally:
