@@ -4,7 +4,8 @@ Delete a file or directory from a btrfs subvolume **and from every snapshot of
 it**, e.g. to get rid of a large file that btrbk snapshots would otherwise keep
 around for weeks.
 
-Single Python file, stdlib only, plus the `btrfs` command (btrfs-progs).
+Single Python file, stdlib only (Python >= 3.11), plus the `btrfs` command
+(btrfs-progs).
 
 > [!WARNING]
 > **Do not use this if your snapshots are used for `btrfs send`/`receive`.**
@@ -46,9 +47,13 @@ Single Python file, stdlib only, plus the `btrfs` command (btrfs-progs).
    - every `-s DIR` (default `/var/.snapshot`),
    - `<subvolume root>/.snapshots` (e.g. `~/.snapshots`),
    - the directory of the snapshot `PATH` points into, if it does.
+
+   Snapshots may sit directly in those directories (btrbk: `DIR/name.DATE`)
+   or one level down (snapper: `DIR/N/snapshot`).
 3. Shows what it would delete (with sizes) and asks.
 4. For each match: makes a read-only snapshot writable, deletes, and **always**
-   makes it read-only again (also on errors, Ctrl-C, SIGTERM).
+   makes it read-only again (also on errors). Ctrl-C, SIGTERM and SIGHUP stop
+   the run *between* snapshots, never in the middle of one.
 
 Other subvolumes that happen to contain the same relative path are never
 touched.
@@ -138,8 +143,14 @@ Delete? [y/N]
   snapshots before backing up; btrbk creates/rotates snapshots). Checked at
   start and again right after you confirm, but it can't prevent one from
   *starting* during the deletion.
+- Deletes through directory file descriptors opened with `O_NOFOLLOW` from
+  the subvolume root, checking at each step that it stays on the same
+  subvolume. If a directory on the path is swapped for a symlink between
+  planning and deletion, the deletion fails instead of escaping.
 - Skips (and says why):
-  - targets containing a nested subvolume or a mount point. Empty
+  - targets that are, contain, or lie below a mount point (bind mounts on the
+    same filesystem included, via `/proc/self/mountinfo`; checked again right
+    before deleting), or that contain a nested subvolume. Empty
     nested-subvolume placeholders inside snapshots are fine.
   - paths that go through a symlink inside a snapshot.
   - received snapshots (those with a `received_uuid`).

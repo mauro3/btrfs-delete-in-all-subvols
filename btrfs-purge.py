@@ -11,8 +11,12 @@ as long as its parent directory exists) or into a snapshot, e.g.
 Matching is by path relative to the subvolume root. "Same subvolume" is
 determined by UUID: a snapshot belongs to a source if its parent_uuid equals
 the source's uuid. Read-only snapshots are temporarily made writable and are
-always set read-only again afterwards. Needs only Python's stdlib plus the
-btrfs command (for toggling read-only). Run as root.
+always set read-only again afterwards. Needs Python >= 3.11 (stdlib only) plus
+the btrfs command (for toggling read-only). Run as root.
+
+Deletion is done through directory file descriptors opened with O_NOFOLLOW
+from the subvolume root, so a path component swapped for a symlink after
+planning makes the deletion fail instead of escaping the subvolume.
 
 Default is to show the plan and ask. Use -n for dry run, -y to skip the prompt.
 """
@@ -28,6 +32,9 @@ import struct
 import subprocess
 import sys
 import uuid as uuidlib
+
+if sys.version_info < (3, 11):
+    sys.exit("error: needs Python >= 3.11")
 
 DEFAULT_SNAPSHOT_DIR = "/var/.snapshot"
 BLOCKING_PROCS = {"borg", "borgmatic", "btrbk"}
@@ -80,13 +87,26 @@ def find_subvol_root(path):
         p = os.path.dirname(p)
 
 
-def btrfs_mountpoints():
+def mountpoints(fstype=None):
+    """Mount points from /proc/self/mountinfo, optionally of one fs type."""
     with open("/proc/self/mountinfo") as f:
         for line in f:
             left, _, right = line.partition(" - ")
-            if right.split()[0] == "btrfs":
+            if fstype is None or right.split()[0] == fstype:
                 yield re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)),
                              left.split()[4])
+
+
+def mount_conflict(subvol_root, target, mounts=None):
+    """A mount point that is the target, inside it, or on the path between the
+    subvolume root and the target (bind mounts included), else None."""
+    root = os.path.realpath(subvol_root)
+    for m in mountpoints() if mounts is None else mounts:
+        if m == root or not m.startswith(root + "/"):
+            continue
+        if m == target or m.startswith(target + "/") or target.startswith(m + "/"):
+            return m
+    return None
 
 
 def find_live_subvol(source_uuid, snapshot_root):
@@ -101,7 +121,7 @@ def find_live_subvol(source_uuid, snapshot_root):
             except OSError:
                 pass
         p = os.path.dirname(p)
-    for mp in btrfs_mountpoints():
+    for mp in mountpoints("btrfs"):
         if is_subvol_root(mp):
             try:
                 if Subvol(mp).uuid == source_uuid:
@@ -138,13 +158,23 @@ def path_is_contained(subvol_root, rel, target):
     return os.path.realpath(os.path.dirname(target)) == expected
 
 
-def scan_tree(target):
+def is_placeholder(path, st):
+    """A nested subvolume appears inside a snapshot as an empty placeholder
+    dir (ino 2); rmdir removes it."""
+    return (stat.S_ISDIR(st.st_mode) and st.st_ino == BTRFS_EMPTY_SUBVOL_DIR_INO
+            and not os.listdir(path))
+
+
+def scan_tree(target, dev):
     """Return (allocated bytes, nested-subvolume/mount path or None,
-    True if some directories could not be read)."""
+    True if some directories could not be read). dev is the subvolume's st_dev;
+    anything on another device (other subvolume, mount) is reported."""
     st = os.lstat(target)
+    if st.st_dev != dev and not is_placeholder(target, st):
+        return 0, target, False
     if not stat.S_ISDIR(st.st_mode):
         return st.st_blocks * 512, None, False
-    dev, total, stack, incomplete = st.st_dev, st.st_blocks * 512, [target], False
+    total, stack, incomplete = st.st_blocks * 512, [target], False
     while stack:
         try:
             entries = list(os.scandir(stack.pop()))
@@ -154,10 +184,7 @@ def scan_tree(target):
         for e in entries:
             est = e.stat(follow_symlinks=False)
             if est.st_dev != dev:
-                # A nested subvolume appears inside a snapshot as an empty
-                # placeholder dir (ino 2); rmdir removes it. Anything else is
-                # a real nested subvolume or a mount: refuse.
-                if est.st_ino == BTRFS_EMPTY_SUBVOL_DIR_INO and not os.listdir(e.path):
+                if is_placeholder(e.path, est):
                     continue
                 return total, e.path, incomplete
             total += est.st_blocks * 512
@@ -204,6 +231,8 @@ def plan(arg, snapdirs, include_live):
         source_uuid = info.parent_uuid
         live_root = find_live_subvol(source_uuid, root)
         dirs.append(os.path.dirname(root))
+        if os.path.basename(root) == "snapshot":  # snapper: .snapshots/N/snapshot
+            dirs.append(os.path.dirname(os.path.dirname(root)))
     else:
         source_uuid = info.uuid
         live_root = root
@@ -223,12 +252,22 @@ def plan(arg, snapdirs, include_live):
         except PermissionError:
             print(f"warning: cannot list {d}: permission denied", file=sys.stderr)
             continue
+        # Snapshots directly in d, or one level down (snapper: d/N/snapshot).
+        candidates = []
         for e in entries:
             if is_subvol_root(e.path):
-                s = Subvol(e.path)
-                if s.parent_uuid == source_uuid and s.uuid not in seen_uuids:
-                    seen_uuids.add(s.uuid)
-                    subvols.append(s)
+                candidates.append(e.path)
+            elif e.is_dir(follow_symlinks=False):
+                try:
+                    candidates += sorted(c.path for c in os.scandir(e.path)
+                                         if is_subvol_root(c.path))
+                except OSError:
+                    pass
+        for c in candidates:
+            s = Subvol(c)
+            if s.parent_uuid == source_uuid and s.uuid not in seen_uuids:
+                seen_uuids.add(s.uuid)
+                subvols.append(s)
 
     targets = []  # (subvol, target, access denied?)
     for s in subvols:
@@ -244,39 +283,92 @@ def plan(arg, snapdirs, include_live):
     return p, rel, live, in_snapshot, sorted(seen_dirs), len(subvols), targets
 
 
+def check_target(s, rel, t, denied):
+    """Return (reason to skip or None, allocated size, size incomplete?)."""
+    if denied:
+        return "permission denied, can't tell if it exists (run as root)", 0, False
+    if s.received_uuid != NULL_UUID:
+        return "received snapshot (send/receive target), not touched", 0, False
+    if not path_is_contained(s.path, rel, t):
+        return "path goes through a symlink", 0, False
+    m = mount_conflict(s.path, t)
+    if m:
+        return f"mount point {m} on or below the path", 0, False
+    size, nested, incomplete = scan_tree(t, os.lstat(s.path).st_dev)
+    if nested:
+        return f"contains nested subvolume/mount {nested}", 0, False
+    return None, size, incomplete
+
+
 # --- deletion ---------------------------------------------------------------
 
 def set_ro(path, value):
+    # Own process group: a Ctrl-C at the terminal must not kill btrfs midway.
     subprocess.run(["btrfs", "property", "set", "-ts", path, "ro",
-                    "true" if value else "false"], check=True)
+                    "true" if value else "false"], check=True, process_group=0)
 
 
-def remove(target):
-    if os.path.isdir(target) and not os.path.islink(target):
-        shutil.rmtree(target)
-    else:
-        os.unlink(target)
+_NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-def delete_in(s, target):
-    if not s.readonly:
-        remove(target)
-        return
-    set_ro(s.path, False)
+def remove_at(subvol_root, rel):
+    """Delete subvol_root/rel without following symlinks or leaving the
+    subvolume: walk to the parent with O_NOFOLLOW dir fds, check each stays
+    on the subvolume's device, then unlink/rmtree relative to that fd."""
+    parts = rel.split("/")
+    if not parts or any(c in ("", ".", "..") for c in parts):
+        raise ValueError(f"bad relative path {rel!r}")
+    fd = os.open(subvol_root, _NOFOLLOW_DIR)
     try:
-        remove(target)
+        dev = os.fstat(fd).st_dev
+        for comp in parts[:-1]:
+            nfd = os.open(comp, _NOFOLLOW_DIR, dir_fd=fd)  # ELOOP if symlink
+            os.close(fd)
+            fd = nfd
+            if os.fstat(fd).st_dev != dev:
+                raise OSError(f"{comp}: crosses into another subvolume/mount")
+        name = parts[-1]
+        st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISDIR(st.st_mode):
+            if st.st_dev != dev and st.st_ino != BTRFS_EMPTY_SUBVOL_DIR_INO:
+                raise OSError(f"{name}: is another subvolume/mount")
+            shutil.rmtree(name, dir_fd=fd)  # fd-based, never follows symlinks
+        else:
+            os.unlink(name, dir_fd=fd)
     finally:
-        try:
-            set_ro(s.path, True)
-        except Exception as e:
-            print(f"!!! FAILED to make {s.path} read-only again: {e}\n"
-                  f"!!! fix manually: btrfs property set -ts {s.path} ro true",
-                  file=sys.stderr)
-            raise
+        os.close(fd)
 
 
-def _raise_interrupt(signum, frame):
-    raise KeyboardInterrupt
+def delete_in(s, rel):
+    """Delete rel inside subvolume s, making it writable temporarily."""
+    t = os.path.join(s.path, rel)
+    m = mount_conflict(s.path, t)  # re-check now, not only at planning time
+    if m:
+        raise OSError(f"mount point {m} on or below the path")
+    readonly = Subvol(s.path).readonly
+    try:
+        if readonly:
+            set_ro(s.path, False)
+        remove_at(s.path, rel)
+    finally:
+        if readonly:
+            try:
+                set_ro(s.path, True)
+            except Exception as e:
+                print(f"!!! FAILED to make {s.path} read-only again: {e}\n"
+                      f"!!! fix manually: btrfs property set -ts {s.path} ro true",
+                      file=sys.stderr)
+                raise
+
+
+_stop_requested = False
+
+
+def _request_stop(signum, frame):
+    global _stop_requested
+    _stop_requested = True
+    print(f"\n{signal.Signals(signum).name}: stopping after the current item "
+          "(its snapshot is restored to read-only first)", file=sys.stderr)
 
 
 def main():
@@ -319,24 +411,13 @@ def main():
             print(f"  live subvolume: {live or 'not found (not an ancestor of the snapshot, not mounted); skipped'}")
         print(f"  {len(targets)} of {n_subvols} subvolumes contain it (or might):")
         for s, t, denied in targets:
-            size, nested, incomplete = (0, None, False) if denied else scan_tree(t)
-            flags = []
-            if s.readonly:
-                flags.append("ro")
-            skip = None
-            if denied:
-                skip = "permission denied, can't tell if it exists (run as root)"
-            elif nested:
-                skip = f"contains nested subvolume/mount {nested}"
-            elif not path_is_contained(s.path, rel, t):
-                skip = "path goes through a symlink"
-            elif s.received_uuid != NULL_UUID:
-                skip = "received snapshot (send/receive target), not touched"
+            skip, size, incomplete = check_target(s, rel, t, denied)
+            flags = ["ro"] if s.readonly else []
             mark = (f"SKIP: {skip}" if skip else
                     f">= {human(size)}, some dirs unreadable" if incomplete else human(size))
             print(f"    {'[' + ','.join(flags) + ']':5} {t}  ({mark})")
             if not skip:
-                work.append((s, t))
+                work.append((s, rel, t))
                 total += size
         if not targets:
             print("    (nothing found)")
@@ -351,26 +432,34 @@ def main():
     if not args.yes:
         if not sys.stdin.isatty():
             sys.exit("error: not a terminal; use -y to confirm")
-        if input("Delete? [y/N] ").strip().lower() not in ("y", "yes"):
-            sys.exit("aborted")
+        try:
+            answer = input("Delete? [y/N] ")
+        except (KeyboardInterrupt, EOFError):
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            sys.exit("\naborted")
 
     # Re-check right before acting: borg may have started while we waited.
     procs = blocking_processes()
     if procs:
         sys.exit("error: refusing to run while these are active: " + ", ".join(procs))
 
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _raise_interrupt)
+    # From here on, signals only request a stop between items, so a snapshot
+    # is never left writable by an interruption.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _request_stop)
     failed = 0
-    for s, t in work:
+    for s, rel, t in work:
+        if _stop_requested:
+            sys.exit("stopped; remaining items were not touched")
         try:
-            delete_in(s, t)
+            delete_in(s, rel)
             print(f"deleted {t}")
-        except KeyboardInterrupt:
-            sys.exit("\ninterrupted (current snapshot was restored to read-only)")
         except Exception as e:
             failed += 1
             print(f"FAILED  {t}: {e}", file=sys.stderr)
+    if _stop_requested:
+        sys.exit("stopped after the last item")
     if failed:
         sys.exit(f"{failed} deletion(s) failed")
     print("done. Space is reclaimed by btrfs in the background (btrfs-cleaner).")

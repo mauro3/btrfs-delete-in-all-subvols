@@ -10,9 +10,12 @@ directory) and removed afterwards.
     BTRFS_TEST_DIR=/some/btrfs/dir ./test_btrfs_purge.py
 """
 
+import contextlib
 import importlib.util
+import io
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -254,15 +257,119 @@ class PurgeTest(unittest.TestCase):
 
     def test_snapshot_restored_ro_when_delete_fails(self):
         s = bp.Subvol(self.snapshot("s1"))
-        orig = bp.remove
-        bp.remove = lambda t: (_ for _ in ()).throw(KeyboardInterrupt)
+        orig = bp.remove_at
+        bp.remove_at = lambda root, rel: (_ for _ in ()).throw(RuntimeError("boom"))
         try:
-            with self.assertRaises(KeyboardInterrupt):
-                bp.delete_in(s, os.path.join(s.path, "me/vm/big.img"))
+            with self.assertRaises(RuntimeError):
+                bp.delete_in(s, "me/vm/big.img")
         finally:
-            bp.remove = orig
+            bp.remove_at = orig
         self.assertTrue(bp.Subvol(s.path).readonly)
         self.assertTrue(self.exists("snaps/s1/me/vm/big.img"))
+
+    def test_symlink_swapped_in_after_planning_does_not_escape(self):
+        # Plan sees a real dir; before deletion it is replaced by a symlink
+        # pointing outside. remove_at must refuse instead of following it.
+        outside = self.p("outside")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "big.img"), "w") as f:
+            f.write("must survive")
+        s = bp.Subvol(self.live)
+        shutil.rmtree(self.p("live/me/vm"))
+        os.symlink(outside, self.p("live/me/vm"))
+        with self.assertRaises(OSError):
+            bp.delete_in(s, "me/vm/big.img")
+        self.assertTrue(os.path.exists(os.path.join(outside, "big.img")))
+
+    def test_symlink_swap_within_same_subvolume_does_not_redirect(self):
+        # Symlink to another dir on the *same* subvolume: the device check
+        # can't catch this, only O_NOFOLLOW does.
+        os.makedirs(self.p("live/precious"))
+        with open(self.p("live/precious/big.img"), "w") as f:
+            f.write("must survive")
+        s = bp.Subvol(self.live)
+        shutil.rmtree(self.p("live/me/vm"))
+        os.symlink("../precious", self.p("live/me/vm"))
+        with self.assertRaises(OSError):
+            bp.delete_in(s, "me/vm/big.img")
+        self.assertTrue(self.exists("live/precious/big.img"))
+
+    def test_symlinked_target_dir_is_unlinked_not_followed(self):
+        outside = self.p("outside")
+        os.makedirs(outside)
+        open(os.path.join(outside, "f"), "w").close()
+        shutil.rmtree(self.p("live/me/vm"))
+        os.symlink(outside, self.p("live/me/vm"))
+        bp.delete_in(bp.Subvol(self.live), "me/vm")
+        self.assertFalse(self.exists("live/me/vm"))
+        self.assertTrue(os.path.exists(os.path.join(outside, "f")))
+
+    def test_bad_relative_paths_rejected(self):
+        for rel in ("../x", "me/../../x", "", "/etc/passwd", "me//x"):
+            with self.assertRaises(ValueError, msg=rel):
+                bp.remove_at(self.live, rel)
+
+    def test_mount_conflict(self):
+        root = os.path.realpath(self.live)
+        t = root + "/me/vm"
+        mc = lambda mounts: bp.mount_conflict(root, t, mounts)
+        self.assertIsNone(mc([root, "/", root + "/other", root + "/me/vmx"]))
+        self.assertEqual(mc([t]), t)                                # target is a mount
+        self.assertEqual(mc([t + "/sub"]), t + "/sub")              # mount inside target
+        self.assertEqual(mc([root + "/me"]), root + "/me")          # (bind) mount on the path
+
+    def test_snapper_layout_found(self):
+        # .snapshots/<N>/snapshot, as snapper does it
+        for n in ("1", "2"):
+            os.makedirs(self.p(f"snaps/{n}"))
+            self.snapshot(f"{n}/snapshot")
+        self.run_purge("-y", "-s", "snaps", "live/me/vm/big.img")
+        self.assertFalse(self.exists("snaps/1/snapshot/me/vm/big.img"))
+        self.assertFalse(self.exists("snaps/2/snapshot/me/vm/big.img"))
+        for n in ("1", "2"):
+            self.assertTrue(bp.Subvol(self.p(f"snaps/{n}/snapshot")).readonly)
+
+    def test_snapper_layout_from_snapshot_path(self):
+        for n in ("1", "2"):
+            os.makedirs(self.p(f"snaps/{n}"))
+            self.snapshot(f"{n}/snapshot")
+        # Sibling snapshots in snaps/<N>/snapshot are found. (The live subvol is
+        # not: here it is neither mounted nor an ancestor of the snapshots.)
+        r = self.run_purge("-n", "snaps/1/snapshot/me/vm/big.img")
+        self.assertIn("2 of 2 subvolumes", r.stdout)
+        self.assertIn("snaps/2/snapshot/me/vm/big.img", r.stdout)
+
+    def test_interrupt_stops_between_items_and_restores_ro(self):
+        self.snapshot("s1")
+        self.snapshot("s2")
+        orig_remove, orig_argv = bp.remove_at, sys.argv
+        handlers = {sig: signal.getsignal(sig)
+                    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        calls = []
+
+        def remove_then_interrupt(root, rel):
+            calls.append(root)
+            orig_remove(root, rel)
+            os.kill(os.getpid(), signal.SIGINT)  # Ctrl-C in the middle of item 1
+
+        bp.remove_at = remove_then_interrupt
+        sys.argv = ["btrfs-purge", "-y", "--snapshots-only",
+                    "-s", self.snaps, self.p("live/me/vm/big.img")]
+        try:
+            with self.assertRaises(SystemExit) as cm, \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                bp.main()
+        finally:
+            bp.remove_at, sys.argv = orig_remove, orig_argv
+            for sig, h in handlers.items():
+                signal.signal(sig, h)
+            bp._stop_requested = False
+        self.assertIn("stopped", str(cm.exception.code))
+        self.assertEqual(len(calls), 1)
+        remaining = [n for n in ("s1", "s2") if self.exists(f"snaps/{n}/me/vm/big.img")]
+        self.assertEqual(len(remaining), 1)
+        self.assert_all_ro()
 
     @unittest.skipIf(os.geteuid() == 0, "root can read everything")
     def test_unreadable_reported_not_missed(self):
