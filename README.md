@@ -60,6 +60,9 @@ ioctls, so it doesn't even need btrfs-progs (the tests do).
 5. Rescans, and offers to delete copies in snapshots that appeared during the
    run (see [Running alongside btrbk](#running-alongside-btrbk)).
 
+The same item given twice, or a path inside another given directory, is
+deleted once.
+
 Other subvolumes that happen to contain the same relative path are never
 touched.
 
@@ -202,7 +205,10 @@ shows when). That is safe:
 - A snapshot btrbk takes during the run can't get a copy that was already
   deleted from the live subvolume, and live copies are deleted first. If one
   still slipped in, the rescan at the end finds it and offers to delete it
-  (or just does, with `-y`).
+  (or just does, with `-y`). The rescan only looks at *new snapshots of the
+  subvolume planned at the start*, in the directories searched then; it never
+  resolves the command-line paths again, so a subvolume moved into place
+  during the run is not touched.
 - A snapshot btrbk rotates away during the run is reported as `gone`, not as
   a failure.
 - A snapshot is writable only for the moment its copy is deleted.

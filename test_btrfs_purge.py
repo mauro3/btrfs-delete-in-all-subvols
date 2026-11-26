@@ -596,9 +596,70 @@ volume /var/home/m3
         code, out, err = self.run_main("-y", "-s", self.snaps,
                                        self.p("live/me/vm/big.img"), hook=btrbk_snapshots)
         self.assertEqual(code, 0, out + err)
-        self.assertIn("appeared during the run", out)
+        self.assertIn("in snapshots taken during the run", out)
         self.assertFalse(self.exists("snaps/late/me/vm/big.img"))
         self.assert_all_ro()
+
+    def test_rescan_ignores_unrelated_subvolume_moved_to_live_path(self):
+        # The reviewer's case: after the first deletion, an unrelated
+        # subvolume is moved to the live subvolume's path. The rescan must
+        # only consider new snapshots of the planned source.
+        self.snapshot("s1")
+        btrfs("subvolume", "create", self.p("other"))
+        os.makedirs(self.p("other/me/vm"))
+        self.write("other/me/vm/big.img", 10)
+
+        def swap_live(n, root_fd, rel):
+            if n == 1:  # live copy already deleted
+                os.rename(self.live, self.p("live.orig"))
+                os.rename(self.p("other"), self.live)
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=swap_live)
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(self.exists("live/me/vm/big.img"))  # the unrelated one
+        self.assertNotIn("taken during the run", out)
+
+    def test_rescan_ignores_unrelated_snapshot_in_snapshot_dir(self):
+        # A new snapshot of a *different* source appearing in the same dir.
+        self.snapshot("s1")
+        btrfs("subvolume", "create", self.p("other"))
+        os.makedirs(self.p("other/me/vm"))
+        self.write("other/me/vm/big.img", 10)
+
+        def other_snapshot(n, root_fd, rel):
+            if n == 0:
+                self.snapshot("other.1", src="other")
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=other_snapshot)
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(self.exists("snaps/other.1/me/vm/big.img"))
+
+    def test_duplicate_paths_merged(self):
+        self.snapshot("s1")
+        r = self.run_purge("-y", "-s", "snaps", "live/me/vm/big.img",
+                           "live/me/vm/big.img", self.p("live/me/vm/big.img"))
+        self.assertIn("merged", r.stdout)
+        self.assertNotIn("FAILED", r.stderr)
+        self.assertFalse(self.exists("snaps/s1/me/vm/big.img"))
+
+    def test_path_inside_other_path_merged(self):
+        self.snapshot("s1")
+        r = self.run_purge("-y", "-s", "snaps", "live/me/vm/big.img", "live/me/vm")
+        self.assertIn("2 repeated or overlapping item(s) merged", r.stdout)
+        self.assertNotIn("FAILED", r.stderr)
+        self.assertFalse(self.exists("live/me/vm"))
+        self.assertFalse(self.exists("snaps/s1/me/vm"))
+
+    def test_same_file_via_live_and_snapshot_path_merged(self):
+        self.snapshot("s1")
+        os.mkdir(self.p("live/.snapshots"))
+        self.snapshot("h1", dest="live/.snapshots")
+        r = self.run_purge("-y", "-s", "snaps", "live/me/vm/big.img",
+                           "live/.snapshots/h1/me/vm/big.img")
+        self.assertNotIn("FAILED", r.stderr)
+        self.assertFalse(self.exists("live/.snapshots/h1/me/vm/big.img"))
 
     def test_snapshot_rotated_away_is_not_a_failure(self):
         self.snapshot("s1")

@@ -28,6 +28,7 @@ Default is to show the plan and ask. Use -n for dry run, -y to skip the prompt.
 """
 
 import argparse
+import collections
 import fcntl
 import os
 import re
@@ -342,21 +343,32 @@ def plan(arg, snapdirs, include_live):
         dirs.append(os.path.join(live_root, ".snapshots"))
     live = live_root if include_live else None
 
-    seen_dirs, seen_uuids = set(), set()
+    dirs = list(dict.fromkeys(os.path.realpath(d) for d in dirs))
     subvols = [Subvol(live)] if live else []
-    if live:
-        seen_uuids.add(subvols[0].uuid)
+    subvols += find_snapshots(dirs, source_uuid, {s.uuid for s in subvols})
+    pin = Pin(source_uuid, rel, [d for d in dirs if os.path.isdir(d)],
+              {s.uuid for s in subvols})
+    return p, rel, live, in_snapshot, pin, len(subvols), list_targets(subvols, rel)
+
+
+# What a rescan may look at: snapshots of the *planned* source, in the
+# directories searched at planning time, that were not known then. The
+# command-line paths are never resolved again.
+Pin = collections.namedtuple("Pin", "source_uuid rel dirs known_uuids")
+
+
+def find_snapshots(dirs, source_uuid, skip_uuids):
+    """Snapshots of source_uuid directly in one of dirs, or one level down
+    (snapper: d/N/snapshot), except those in skip_uuids."""
+    found, seen = [], set(skip_uuids)
     for d in dirs:
-        d = os.path.realpath(d)
-        if d in seen_dirs or not os.path.isdir(d):
+        if not os.path.isdir(d):
             continue
-        seen_dirs.add(d)
         try:
             entries = sorted(os.scandir(d), key=lambda e: e.name)
         except PermissionError:
             print(f"warning: cannot list {d}: permission denied", file=sys.stderr)
             continue
-        # Snapshots directly in d, or one level down (snapper: d/N/snapshot).
         candidates = []
         for e in entries:
             if is_subvol_root(e.path):
@@ -372,11 +384,16 @@ def plan(arg, snapdirs, include_live):
                 s = Subvol(c)
             except OSError:
                 continue  # vanished meanwhile, or not readable
-            if s.parent_uuid == source_uuid and s.uuid not in seen_uuids:
-                seen_uuids.add(s.uuid)
-                subvols.append(s)
+            if s.parent_uuid == source_uuid and s.uuid not in seen:
+                seen.add(s.uuid)
+                found.append(s)
+    return found
 
-    targets = []  # (subvol, target, identity or None if access denied)
+
+def list_targets(subvols, rel):
+    """[(subvol, target path, identity or None if access denied)] for the
+    subvolumes in which rel exists."""
+    targets = []
     for s in subvols:
         t = os.path.join(s.path, rel)
         try:
@@ -387,7 +404,7 @@ def plan(arg, snapdirs, include_live):
             pass
         else:
             targets.append((s, t, identity(st)))
-    return p, rel, live, in_snapshot, sorted(seen_dirs), len(subvols), targets
+    return targets
 
 
 def identity(st):
@@ -413,41 +430,75 @@ def check_target(s, rel, t, ident):
     return None, size, incomplete
 
 
-def build_work(paths, snapdirs, include_live, exclude=frozenset(), quiet=False):
-    """Plan all paths. Returns (work items, total size). Work items are
-    (subvol, rel, target, is_live, identity), live copies first: if btrbk snapshots the
-    live subvolume during the run, the new snapshot won't contain the item."""
-    out = (lambda *a, **k: None) if quiet else print
-    work, total = [], 0
-    for arg in paths:
-        try:
-            p, rel, live, in_snapshot, searched, n_subvols, targets = plan(
-                arg, snapdirs, include_live)
-        except PlanError as e:
-            if quiet:
-                continue
-            raise
-        targets = [x for x in targets if (x[0].uuid, rel) not in exclude]
-        if quiet and not targets:
+Item = collections.namedtuple("Item", "subvol rel target is_live ident size")
+
+
+def describe_targets(targets, rel, live, out=print):
+    """Print targets with sizes/skip reasons; return the Items to delete."""
+    items = []
+    for s, t, ident in targets:
+        skip, size, incomplete = check_target(s, rel, t, ident)
+        flags = ["ro"] if s.readonly else []
+        mark = (f"SKIP: {skip}" if skip else
+                f">= {human(size)}, some dirs unreadable" if incomplete else human(size))
+        out(f"    {'[' + ','.join(flags) + ']':5} {t}  ({mark})")
+        if not skip:
+            items.append(Item(s, rel, t, s.path == live, ident, size))
+    return items
+
+
+def dedupe(work):
+    """Drop repeated items (same subvolume and relative path) and items
+    inside another item of the same subvolume (deleting a dir covers them)."""
+    keys = {(w.subvol.uuid, w.rel) for w in work}
+    out, seen = [], set()
+    for w in work:
+        k = (w.subvol.uuid, w.rel)
+        parts = w.rel.split("/")
+        inside = any((w.subvol.uuid, "/".join(parts[:i])) in keys
+                     for i in range(1, len(parts)))
+        if k in seen or inside:
             continue
-        out(f"\n{p}\n  relative path: {rel}")
-        out(f"  snapshot dirs: {', '.join(searched) or '(none found)'}")
+        seen.add(k)
+        out.append(w)
+    return out
+
+
+def build_work(paths, snapdirs, include_live):
+    """Plan all paths. Returns (work items, pins). Live copies come first: if
+    btrbk snapshots the live subvolume during the run, the new snapshot
+    won't contain the item."""
+    work, pins = [], []
+    for arg in paths:
+        p, rel, live, in_snapshot, pin, n_subvols, targets = plan(
+            arg, snapdirs, include_live)
+        pins.append(pin)
+        print(f"\n{p}\n  relative path: {rel}")
+        print(f"  snapshot dirs: {', '.join(pin.dirs) or '(none found)'}")
         if in_snapshot and include_live:
-            out(f"  live subvolume: {live or 'not found (not an ancestor of the snapshot, not mounted); skipped'}")
-        out(f"  {len(targets)} of {n_subvols} subvolumes contain it (or might):")
-        for s, t, ident in targets:
-            skip, size, incomplete = check_target(s, rel, t, ident)
-            flags = ["ro"] if s.readonly else []
-            mark = (f"SKIP: {skip}" if skip else
-                    f">= {human(size)}, some dirs unreadable" if incomplete else human(size))
-            out(f"    {'[' + ','.join(flags) + ']':5} {t}  ({mark})")
-            if not skip:
-                work.append((s, rel, t, s.path == live, ident))
-                total += size
+            print(f"  live subvolume: {live or 'not found (not an ancestor of the snapshot, not mounted); skipped'}")
+        print(f"  {len(targets)} of {n_subvols} subvolumes contain it (or might):")
+        work += describe_targets(targets, rel, live)
         if not targets:
-            out("    (nothing found)")
-    work.sort(key=lambda w: not w[3])  # stable: live copies first
-    return work, total
+            print("    (nothing found)")
+    n = len(work)
+    work = dedupe(work)
+    if len(work) < n:
+        print(f"\nnote: {n - len(work)} repeated or overlapping item(s) merged")
+    work.sort(key=lambda w: not w.is_live)  # stable: live copies first
+    return work, pins
+
+
+def rescan(pins):
+    """Work for snapshots that appeared since planning: only snapshots of each
+    pinned source, in the pinned dirs, not known before. Marks them known."""
+    work = []
+    for pin in pins:
+        new = find_snapshots(pin.dirs, pin.source_uuid, pin.known_uuids)
+        pin.known_uuids.update(s.uuid for s in new)
+        work += describe_targets(list_targets(new, pin.rel), pin.rel, None,
+                                 out=lambda *a: None)
+    return dedupe(work)
 
 
 # --- deletion ---------------------------------------------------------------
@@ -569,7 +620,7 @@ def _request_stop(signum, frame):
 def run_work(work):
     """Delete all work items. Returns (done, failed) sets of (uuid, rel)."""
     done, failed = set(), set()
-    for s, rel, t, _, ident in work:
+    for s, rel, t, _, ident, _ in work:
         if _stop_requested:
             sys.exit("stopped; remaining items were not touched")
         try:
@@ -633,9 +684,10 @@ def main():
               "and sizes may be incomplete", file=sys.stderr)
 
     try:
-        work, total = build_work(args.paths, snapdirs, include_live)
+        work, pins = build_work(args.paths, snapdirs, include_live)
     except PlanError as e:
         sys.exit(f"error: {e}")
+    total = sum(w.size for w in work)
     if not work:
         print("\nNothing to delete.")
         return
@@ -653,15 +705,15 @@ def main():
         signal.signal(sig, _request_stop)
     done, failed = run_work(work)
 
-    # btrbk may have taken a snapshot while we were deleting: look again.
+    # btrbk may have taken a snapshot while we were deleting: look again, but
+    # only at new snapshots of the sources planned above.
     for _ in range(MAX_RESCANS):
-        work, total = build_work(args.paths, snapdirs, include_live,
-                                 exclude=done | failed, quiet=True)
+        work = rescan(pins)
         if not work:
             break
-        print(f"\n{len(work)} item(s) appeared during the run (new snapshots?):")
-        for _, _, t, _, _ in work:
-            print(f"    {t}")
+        print(f"\n{len(work)} item(s) in snapshots taken during the run:")
+        for w in work:
+            print(f"    {w.target}")
         if not args.yes and not confirm("Delete these too? [y/N] "):
             break
         d, f = run_work(work)
