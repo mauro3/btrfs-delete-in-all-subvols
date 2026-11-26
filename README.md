@@ -6,6 +6,34 @@ around for weeks.
 
 Single Python file, stdlib only, plus the `btrfs` command (btrfs-progs).
 
+> [!WARNING]
+> **Do not use this if your snapshots are used for `btrfs send`/`receive`.**
+>
+> Incremental send (`btrfs send -p <parent>`) only transfers the difference
+> between a snapshot and its parent, and assumes the parent is identical on
+> both sides. This script modifies snapshots in place, so a modified parent no
+> longer matches the copy on the receiving side. Later incremental sends then
+> fail, or worse, apply cleanly and leave the backup silently different from
+> the source. Received snapshots (with a `received_uuid`) are skipped by
+> default, but the *source* snapshots that serve as send parents look like any
+> other snapshot and cannot be detected.
+>
+> This affects, among others:
+> - **btrbk** with `target` configured (backups). btrbk with only
+>   `snapshot_dir` and no `target`, i.e. used just for local snapshots, is fine.
+> - **snapper** with `snbk` / snapper backup configs, or **snap-sync**
+> - **btrfs-backup**, **buttersink**, **btrfs-sxbackup**, and any custom
+>   `btrfs send | btrfs receive` script or cron job
+> - **Synology/NAS replication** or other tools replicating btrfs snapshots
+>
+> Not affected: file-level backup tools that only *read* a snapshot, such as
+> borg, restic, rsync or kopia.
+>
+> Also think twice if you rely on a snapshot being an exact image of a moment
+> in time: rollback snapshots (snapper/Timeshift), forensic or audit copies, or
+> snapshots compared with `snapper diff` / `btrfs subvolume find-new`. They
+> will no longer contain the deleted files.
+
 ## How it works
 
 1. Finds the subvolume containing `PATH` and the path relative to its root.
@@ -41,7 +69,7 @@ instead of being silently missed.
 
 ## Examples
 
-See what would go, without deleting anything:
+See what would go, without deleting anything (run without `sudo` for extra safety):
 
 ```sh
 btrfs-purge.py -n /var/lib/libvirt/images/old-vm.qcow2
