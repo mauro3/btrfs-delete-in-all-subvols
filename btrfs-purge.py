@@ -29,6 +29,7 @@ Default is to show the plan and ask. Use -n for dry run, -y to skip the prompt.
 
 import argparse
 import collections
+import fnmatch
 import fcntl
 import os
 import re
@@ -172,26 +173,44 @@ def find_live_subvol(source_uuid, snapshot_root):
     return None
 
 
-def btrbk_snapshot_dirs(conf):
-    """Snapshot directories configured in btrbk.conf: each volume's
-    snapshot_dir (relative ones are relative to the volume), or the volume
-    directory itself if none is set (btrbk's default)."""
+def _btrbk_options(conf):
+    """(key, value) pairs of btrbk.conf, comments stripped; [] if unreadable."""
     try:
         with open(conf) as f:
             lines = f.read().splitlines()
     except OSError:
         return []
+    pairs = []
+    for line in lines:
+        words = line.split("#", 1)[0].split(None, 1)
+        if len(words) == 2:
+            pairs.append((words[0], words[1].strip()))
+    return pairs
+
+
+def btrbk_sources(conf):
+    """Source subvolume patterns from btrbk.conf ('subvolume' relative to its
+    'volume'; may contain wildcards)."""
+    patterns, volume = [], None
+    for key, val in _btrbk_options(conf):
+        if key == "volume":
+            volume = os.path.realpath(val)
+        elif key == "subvolume" and volume is not None:
+            patterns.append(os.path.normpath(os.path.join(volume, val)))
+    return patterns
+
+
+def btrbk_snapshot_dirs(conf):
+    """Snapshot directories configured in btrbk.conf: each volume's
+    snapshot_dir (relative ones are relative to the volume), or the volume
+    directory itself if none is set (btrbk's default)."""
     dirs, global_sd, volume, vol_has_sd = [], None, None, False
 
     def close_volume():
         if volume is not None and not vol_has_sd and global_sd is None:
             dirs.append(volume)
 
-    for line in lines:
-        words = line.split("#", 1)[0].split(None, 1)
-        if len(words) != 2:
-            continue
-        key, val = words[0], words[1].strip()
+    for key, val in _btrbk_options(conf):
         if key == "volume":
             close_volume()
             volume, vol_has_sd = val, False
@@ -290,18 +309,31 @@ def resolve_arg(arg):
     name = os.path.basename(a)
     if name in (".", ".."):
         raise PlanError(f"refusing ambiguous path {arg!r}")
-    parent = os.path.realpath(os.path.dirname(a))
+    # strict: every component of the parent must exist, as for the kernel.
+    # (Non-strict realpath would turn missing/../x into x.)
+    try:
+        parent = os.path.realpath(os.path.dirname(a), strict=True)
+    except PermissionError:
+        raise PlanError(f"cannot access {os.path.dirname(a)}: permission denied (run as root)")
+    except OSError as e:
+        raise PlanError(f"parent directory {os.path.dirname(a)} does not exist "
+                        f"({e.strerror})")
     return parent, name
 
 
-def is_snapshot(root, info, snapdirs):
+def is_snapshot(root, info, snapdirs, sources=()):
     """Whether the subvolume at root is a snapshot rather than a live source."""
     if info.parent_uuid == NULL_UUID:
         return False
     if info.readonly:
         return True
-    # Writable, but has a parent: a snapshot if it lives in a snapshot dir.
-    # (A live subvolume restored from a snapshot also has a parent uuid.)
+    # Writable, but has a parent: a snapshot, or a live subvolume restored
+    # from one. Configured btrbk sources and mounted subvolumes are live;
+    # otherwise decide by location (in a snapshot dir -> snapshot).
+    if any(fnmatch.fnmatchcase(root, pat) for pat in sources):
+        return False
+    if root in {os.path.realpath(m) for m in mountpoints("btrfs")}:
+        return False
     in_snapdir = lambda d: d in snapdirs or os.path.basename(d) == ".snapshots"
     d = os.path.dirname(root)
     if in_snapdir(d):
@@ -310,7 +342,7 @@ def is_snapshot(root, info, snapdirs):
     return os.path.basename(root) == "snapshot" and in_snapdir(os.path.dirname(d))
 
 
-def plan(arg, snapdirs, include_live):
+def plan(arg, snapdirs, include_live, sources=()):
     parent, name = resolve_arg(arg)
     try:
         if not stat.S_ISDIR(os.stat(parent).st_mode):
@@ -327,7 +359,7 @@ def plan(arg, snapdirs, include_live):
     root = find_subvol_root(parent)
     rel = os.path.relpath(p, root)
     info = Subvol(root)
-    in_snapshot = is_snapshot(root, info, known)
+    in_snapshot = is_snapshot(root, info, known, sources)
     dirs = list(snapdirs)
 
     if in_snapshot:
@@ -348,7 +380,12 @@ def plan(arg, snapdirs, include_live):
     subvols += find_snapshots(dirs, source_uuid, {s.uuid for s in subvols})
     pin = Pin(source_uuid, rel, [d for d in dirs if os.path.isdir(d)],
               {s.uuid for s in subvols})
-    return p, rel, live, in_snapshot, pin, len(subvols), list_targets(subvols, rel)
+    # Writable subvolumes are only touched if they are the live source or the
+    # one PATH names; other writable children of the source are likely
+    # working clones, not snapshots.
+    rw_ok = {info.uuid} | ({subvols[0].uuid} if live else set())
+    return (p, rel, live, in_snapshot, pin, len(subvols),
+            list_targets(subvols, rel), rw_ok)
 
 
 # What a rescan may look at: snapshots of the *planned* source, in the
@@ -413,12 +450,14 @@ def identity(st):
     return st.st_ino, stat.S_IFMT(st.st_mode)
 
 
-def check_target(s, rel, t, ident):
+def check_target(s, rel, t, ident, rw_ok=frozenset()):
     """Return (reason to skip or None, allocated size, size incomplete?)."""
     if ident is None:
         return "permission denied, can't tell if it exists (run as root)", 0, False
     if s.received_uuid != NULL_UUID:
         return "received snapshot (send/receive target), not touched", 0, False
+    if not s.readonly and s.uuid not in rw_ok:
+        return "writable, so probably a working clone, not a snapshot", 0, False
     if not path_is_contained(s.path, rel, t):
         return "path goes through a symlink", 0, False
     m = mount_conflict(s.path, t)
@@ -433,11 +472,11 @@ def check_target(s, rel, t, ident):
 Item = collections.namedtuple("Item", "subvol rel target is_live ident size")
 
 
-def describe_targets(targets, rel, live, out=print):
+def describe_targets(targets, rel, live, rw_ok=frozenset(), out=print):
     """Print targets with sizes/skip reasons; return the Items to delete."""
     items = []
     for s, t, ident in targets:
-        skip, size, incomplete = check_target(s, rel, t, ident)
+        skip, size, incomplete = check_target(s, rel, t, ident, rw_ok)
         flags = ["ro"] if s.readonly else []
         mark = (f"SKIP: {skip}" if skip else
                 f">= {human(size)}, some dirs unreadable" if incomplete else human(size))
@@ -464,21 +503,21 @@ def dedupe(work):
     return out
 
 
-def build_work(paths, snapdirs, include_live):
+def build_work(paths, snapdirs, include_live, sources=()):
     """Plan all paths. Returns (work items, pins). Live copies come first: if
     btrbk snapshots the live subvolume during the run, the new snapshot
     won't contain the item."""
     work, pins = [], []
     for arg in paths:
-        p, rel, live, in_snapshot, pin, n_subvols, targets = plan(
-            arg, snapdirs, include_live)
+        p, rel, live, in_snapshot, pin, n_subvols, targets, rw_ok = plan(
+            arg, snapdirs, include_live, sources)
         pins.append(pin)
         print(f"\n{p}\n  relative path: {rel}")
         print(f"  snapshot dirs: {', '.join(pin.dirs) or '(none found)'}")
         if in_snapshot and include_live:
             print(f"  live subvolume: {live or 'not found (not an ancestor of the snapshot, not mounted); skipped'}")
         print(f"  {len(targets)} of {n_subvols} subvolumes contain it (or might):")
-        work += describe_targets(targets, rel, live)
+        work += describe_targets(targets, rel, live, rw_ok)
         if not targets:
             print("    (nothing found)")
     n = len(work)
@@ -597,8 +636,8 @@ def delete_in(s, rel, expect=None):
                 set_ro_fd(fd, False)
             remove_at(fd, rel, expect)
         finally:
-            if cur.readonly and not Subvol(s.path, fd).readonly:
-                _restore_ro(s, fd)
+            if cur.readonly:
+                _restore_ro(s, fd)  # set first (idempotent), verify after
     except Exception as e:
         if not isinstance(e, Gone) and not os.path.lexists(s.path):
             raise Gone(s.path) from e
@@ -676,6 +715,7 @@ def main():
         if not os.path.isdir(d):
             sys.exit(f"error: snapshot dir {d} does not exist")
     snapdirs = btrbk_snapshot_dirs(args.btrbk_conf) + args.snapshot_dirs
+    sources = btrbk_sources(args.btrbk_conf)
     include_live = not args.snapshots_only
 
     check_blocking()
@@ -684,7 +724,7 @@ def main():
               "and sizes may be incomplete", file=sys.stderr)
 
     try:
-        work, pins = build_work(args.paths, snapdirs, include_live)
+        work, pins = build_work(args.paths, snapdirs, include_live, sources)
     except PlanError as e:
         sys.exit(f"error: {e}")
     total = sum(w.size for w in work)

@@ -495,6 +495,84 @@ class PurgeTest(unittest.TestCase):
         self.assertFalse(self.exists("snaps/s1/me/vm/big.img"))  # planned copy gone
         self.assert_all_ro()
 
+    # --- review round: strict paths, restored sources, cleanup --------------
+
+    def test_missing_dir_then_dotdot_refused(self):
+        # The kernel rejects live/me/vm/missing/../big.img; so must we.
+        self.snapshot("s1")
+        r = self.run_purge("-y", "-s", "snaps", "live/me/vm/missing/../big.img", ok=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not exist", r.stderr)
+        self.assertTrue(self.exists("live/me/vm/big.img"))
+        self.assertTrue(self.exists("snaps/s1/me/vm/big.img"))
+
+    def test_live_path_of_already_deleted_file_still_works(self):
+        self.snapshot("s1")
+        os.unlink(self.p("live/me/vm/big.img"))
+        self.run_purge("-y", "-s", "snaps", "live/me/vm/big.img")
+        self.assertFalse(self.exists("snaps/s1/me/vm/big.img"))
+
+    def make_restored_source(self):
+        """A writable subvolume restored from snapshot s1, configured as a
+        btrbk source in volume 'vol' without snapshot_dir, with one snapshot
+        of its own next to it (btrbk's default layout)."""
+        self.snapshot("s1")
+        os.mkdir(self.p("vol"))
+        btrfs("subvolume", "snapshot", self.p("snaps/s1"), self.p("vol/restored"))
+        self.snapshot("restored.20261101", src="vol/restored", dest="vol")
+
+    def test_restored_btrbk_source_is_live(self):
+        self.make_restored_source()
+        for pattern in ("restored", "rest*"):  # wildcard also matches the snapshot
+            conf = self.write_conf(f"volume {self.p('vol')}\n  subvolume {pattern}\n")
+            r = self.run_purge("-n", "--snapshots-only", "--btrbk-conf", conf,
+                               "vol/restored/me/vm/big.img")
+            self.assertIn("vol/restored.20261101/me/vm/big.img", r.stdout, pattern)
+            self.assertNotIn("vol/restored/me/vm/big.img  (", r.stdout, pattern)
+        self.run_purge("-y", "--snapshots-only", "--btrbk-conf", conf,
+                       "vol/restored/me/vm/big.img")
+        self.assertTrue(self.exists("vol/restored/me/vm/big.img"))         # live kept
+        self.assertFalse(self.exists("vol/restored.20261101/me/vm/big.img"))
+        self.assertTrue(self.exists("snaps/s1/me/vm/big.img"))  # its origin: unrelated
+
+    def test_writable_clone_of_source_skipped(self):
+        self.snapshot("s1")
+        btrfs("subvolume", "snapshot", self.live, self.p("snaps/clone"))  # writable
+        r = self.run_purge("-y", "-s", "snaps", "live/me/vm/big.img")
+        self.assertIn("working clone", r.stdout)
+        self.assertTrue(self.exists("snaps/clone/me/vm/big.img"))
+        self.assertFalse(self.exists("snaps/s1/me/vm/big.img"))
+
+    def test_ro_restored_even_if_check_after_deletion_fails(self):
+        s = bp.Subvol(self.snapshot("s1"))
+        real_subvol, real_remove = bp.Subvol, bp.remove_at
+        deleted = []
+
+        def remove(*a):
+            real_remove(*a)
+            deleted.append(True)
+
+        def flaky_subvol(path, fd=None):
+            if deleted and fd is not None:
+                raise OSError("injected metadata read failure")
+            return real_subvol(path, fd)
+
+        bp.Subvol, bp.remove_at = flaky_subvol, remove
+        try:
+            with self.assertRaises(OSError), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                bp.delete_in(s, "me/vm/big.img", None)
+        finally:
+            bp.Subvol, bp.remove_at = real_subvol, real_remove
+        self.assertTrue(deleted)
+        self.assertTrue(bp.Subvol(s.path).readonly)
+
+    def test_btrbk_sources_parsing(self):
+        conf = self.write_conf("volume /var\n  subvolume .\n  snapshot_dir .snapshots\n"
+                               "volume /mnt/pool\n  subvolume home*\n  subvolume rootfs\n")
+        self.assertEqual(bp.btrbk_sources(conf),
+                         [os.path.realpath("/var"), "/mnt/pool/home*", "/mnt/pool/rootfs"])
+
     # --- btrbk.conf ---------------------------------------------------------
 
     def write_conf(self, text):

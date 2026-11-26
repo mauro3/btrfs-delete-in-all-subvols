@@ -152,7 +152,8 @@ Delete? [y/N]
   snapshots before backing up; btrbk creates/rotates snapshots). Checked at
   start and again right after you confirm.
 - Resolves `PATH` like the kernel does: symlinks before `..`, so
-  `link/../x` means the `x` next to the link's *target*.
+  `link/../x` means the `x` next to the link's *target*, and `missing/../x`
+  is an error, not `x`. Only the last component may be missing.
 - Works on file descriptors, not paths: each subvolume root is opened once
   and verified by UUID to still be the planned subvolume, the read-only flag
   is toggled on that descriptor (ioctl), and deletion walks from it with
@@ -178,6 +179,8 @@ Delete? [y/N]
     containers) are invisible to the script and can't affect it.
   - paths that go through a symlink inside a snapshot.
   - received snapshots (those with a `received_uuid`).
+  - writable subvolumes descended from the source, unless it is the one
+    `PATH` points into: those are usually working clones, not snapshots.
 - Refuses to delete a subvolume itself; use `btrfs subvolume delete` for that.
 - A symlink given as `PATH` deletes the link, not its target.
 
@@ -192,10 +195,10 @@ Delete? [y/N]
   repositories.
 - The live subvolume is found from a snapshot path only if it is an ancestor of
   the snapshot directory or is mounted somewhere.
-- A writable subvolume with a parent UUID counts as a snapshot only if it sits
+- A writable subvolume with a parent UUID (e.g. one restored from a snapshot)
+  is taken as live if it is a `subvolume` in btrbk.conf (wildcards included)
+  or is mounted somewhere. Otherwise it counts as a snapshot only if it sits
   in a known snapshot directory (btrbk.conf, `-s`, or one named `.snapshots`).
-  Elsewhere it is taken as a live subvolume, as one restored from a snapshot
-  would be.
 
 ## Running alongside btrbk
 
