@@ -292,8 +292,6 @@ def main():
     ap.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     ap.add_argument("--snapshots-only", action="store_true",
                     help="leave the live filesystem alone, only purge snapshots")
-    ap.add_argument("--force-received", action="store_true",
-                    help="also modify snapshots that have a received_uuid (breaks send/receive)")
     args = ap.parse_args()
 
     if args.snapshot_dirs:
@@ -332,8 +330,8 @@ def main():
                 skip = f"contains nested subvolume/mount {nested}"
             elif not path_is_contained(s.path, rel, t):
                 skip = "path goes through a symlink"
-            elif s.received_uuid != NULL_UUID and not args.force_received:
-                skip = "received snapshot (use --force-received)"
+            elif s.received_uuid != NULL_UUID:
+                skip = "received snapshot (send/receive target), not touched"
             mark = (f"SKIP: {skip}" if skip else
                     f">= {human(size)}, some dirs unreadable" if incomplete else human(size))
             print(f"    {'[' + ','.join(flags) + ']':5} {t}  ({mark})")

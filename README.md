@@ -14,8 +14,8 @@ Single Python file, stdlib only, plus the `btrfs` command (btrfs-progs).
 > both sides. This script modifies snapshots in place, so a modified parent no
 > longer matches the copy on the receiving side. Later incremental sends then
 > fail, or worse, apply cleanly and leave the backup silently different from
-> the source. Received snapshots (with a `received_uuid`) are skipped by
-> default, but the *source* snapshots that serve as send parents look like any
+> the source. Received snapshots (with a `received_uuid`) are always skipped,
+> but the *source* snapshots that serve as send parents look like any
 > other snapshot and cannot be detected.
 >
 > This affects, among others:
@@ -56,7 +56,7 @@ touched.
 ## Usage
 
 ```
-btrfs-purge.py [-n] [-y] [-s DIR]... [--snapshots-only] [--force-received] PATH...
+btrfs-purge.py [-n] [-y] [-s DIR]... [--snapshots-only] PATH...
 ```
 
 | Option | |
@@ -65,7 +65,6 @@ btrfs-purge.py [-n] [-y] [-s DIR]... [--snapshots-only] [--force-received] PATH.
 | `-y`, `--yes` | don't ask for confirmation |
 | `-s DIR` | snapshot directory; repeatable (default `/var/.snapshot`) |
 | `--snapshots-only` | leave the live filesystem alone |
-| `--force-received` | also modify snapshots with a `received_uuid` (breaks send/receive) |
 
 Deleting needs root (btrbk snapshots are owned by root). A dry run works as a
 normal user; anything you can't read is reported as `permission denied`
@@ -143,7 +142,7 @@ Delete? [y/N]
   - targets containing a nested subvolume or a mount point. Empty
     nested-subvolume placeholders inside snapshots are fine.
   - paths that go through a symlink inside a snapshot.
-  - received snapshots, unless `--force-received` is given.
+  - received snapshots (those with a `received_uuid`).
 - Refuses to delete a subvolume itself; use `btrfs subvolume delete` for that.
 - A symlink given as `PATH` deletes the link, not its target.
 
@@ -158,3 +157,18 @@ Delete? [y/N]
   repositories.
 - The live subvolume is found from a snapshot path only if it is an ancestor of
   the snapshot directory or is mounted somewhere.
+
+## Tests
+
+`test_btrfs_purge.py` runs the script against real, throwaway btrfs
+subvolumes. It needs no root, only a directory on btrfs that you own (default:
+the repo directory):
+
+```sh
+./test_btrfs_purge.py
+BTRFS_TEST_DIR=/some/btrfs/dir ./test_btrfs_purge.py
+```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
