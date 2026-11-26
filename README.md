@@ -34,6 +34,10 @@ Single Python file, stdlib only, plus the `btrfs` command (btrfs-progs).
 > snapshots compared with `snapper diff` / `btrfs subvolume find-new`. They
 > will no longer contain the deleted files.
 
+> [!WARNING]
+> **Vibe coded with Claude Opus 5.5**
+
+
 ## How it works
 
 1. Finds the subvolume containing `PATH` and the path relative to its root.
