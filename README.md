@@ -80,28 +80,38 @@ btrfs-purge.py [-n] [-y] [-s DIR]... [--btrbk-conf FILE] [--snapshots-only] PATH
 | `--btrbk-conf FILE` | btrbk config to read snapshot dirs from (default `/etc/btrbk/btrbk.conf`, ignored if missing) |
 | `--snapshots-only` | leave the live filesystem alone: only read-only snapshots are touched. A `PATH` inside a writable subvolume that merely sits in a snapshot directory is refused, since it may be a live subvolume |
 
-Deleting needs root (btrbk snapshots are owned by root). A dry run works as a
-normal user; anything you can't read is reported as `permission denied`
+Root is only needed where your user isn't allowed in. The kernel lets the
+*owner* of a subvolume toggle its read-only flag, and a snapshot belongs to
+whoever owns the source subvolume's top directory, even if btrbk (as root)
+created it. So snapshots of your own home subvolume can be purged as your
+user; snapshots of system subvolumes like `/var` need `sudo`. A dry run works
+for anyone; anything you can't read is reported as `permission denied`
 instead of being silently missed.
 
 ## Examples
 
-See what would go, without deleting anything (run without `sudo` for extra safety):
+See what would go, without deleting anything:
 
 ```sh
-btrfs-purge.py -n /var/lib/libvirt/images/old-vm.qcow2
+btrfs-purge.py -n ~/Videos/huge-recording.mkv
 ```
 
-Delete a file from the live filesystem and all snapshots (asks first):
+Delete a file from your home and all its snapshots (asks first):
 
 ```sh
-sudo btrfs-purge.py /var/lib/libvirt/images/old-vm.qcow2
+btrfs-purge.py ~/Videos/huge-recording.mkv
 ```
 
 Delete a whole directory:
 
 ```sh
-sudo btrfs-purge.py ~/Downloads/iso-collection
+btrfs-purge.py ~/Downloads/iso-collection
+```
+
+The same for a file on a system subvolume, whose snapshots belong to root:
+
+```sh
+sudo btrfs-purge.py /var/lib/libvirt/images/old-vm.qcow2
 ```
 
 Already deleted it, or renamed it since? Point at its copy inside any snapshot;
@@ -113,7 +123,8 @@ sudo btrfs-purge.py /var/.snapshots/var.20261101T0000/tmp/huge.tar
 ```
 
 Snapshot directories from btrbk.conf, and `~/.snapshots` if `~` is its own
-subvolume, are found automatically. Others can be added, as many as needed:
+subvolume, are found automatically. Others can be added, as many as needed
+(`sudo` here only because these example directories belong to root):
 
 ```sh
 sudo btrfs-purge.py -s /mnt/old-snapshots -s /srv/.snaps /home/me/big.iso
@@ -122,13 +133,13 @@ sudo btrfs-purge.py -s /mnt/old-snapshots -s /srv/.snaps /home/me/big.iso
 Only clean the snapshots, keep the live copy:
 
 ```sh
-sudo btrfs-purge.py --snapshots-only /var/cache/big-but-needed.img
+btrfs-purge.py --snapshots-only ~/vm/disk-i-still-need.qcow2
 ```
 
 Several paths at once, no prompt (e.g. from a script):
 
 ```sh
-sudo btrfs-purge.py -y /srv/a.iso /srv/b.iso
+btrfs-purge.py -y ~/Downloads/a.iso ~/Downloads/b.iso
 ```
 
 Example output:
