@@ -159,6 +159,12 @@ Delete? [y/N]
   instead of escaping, and the read-only flag still reaches the right
   snapshot. Recursive deletion never descends into another subvolume, even
   one created after the preview.
+- Deletes only what the preview showed: each target's inode number and type
+  are recorded when planning and must still match when deleting. A file
+  replaced by another file or a directory in the meantime is left alone and
+  reported as a failure. (A previewed directory that is still the same
+  directory is deleted with whatever it contains by then, like `rm -r`.
+  Snapshot contents can't change before deletion anyway: they are read-only.)
 - Skips (and says why):
   - targets that are, contain, or lie below a mount point, or that contain a
     nested subvolume. Empty nested-subvolume placeholders inside snapshots

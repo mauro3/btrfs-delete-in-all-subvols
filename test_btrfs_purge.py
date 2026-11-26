@@ -109,11 +109,11 @@ class PurgeTest(unittest.TestCase):
                     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
         calls = []
 
-        def wrapped(root_fd, rel):
+        def wrapped(root_fd, rel, expect=None):
             if hook:
                 hook(len(calls), root_fd, rel)
             calls.append(rel)
-            orig_remove(root_fd, rel)
+            orig_remove(root_fd, rel, expect)
 
         bp.remove_at = wrapped
         sys.argv = ["btrfs-purge", "--btrbk-conf", os.devnull, *args]
@@ -290,7 +290,7 @@ class PurgeTest(unittest.TestCase):
     def test_snapshot_restored_ro_when_delete_fails(self):
         s = bp.Subvol(self.snapshot("s1"))
         orig = bp.remove_at
-        bp.remove_at = lambda root, rel: (_ for _ in ()).throw(RuntimeError("boom"))
+        bp.remove_at = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
         try:
             with self.assertRaises(RuntimeError):
                 bp.delete_in(s, "me/vm/big.img")
@@ -453,6 +453,46 @@ class PurgeTest(unittest.TestCase):
         self.assertEqual(calls, [0])
         remaining = [n for n in ("s1", "s2") if self.exists(f"snaps/{n}/me/vm/big.img")]
         self.assertEqual(len(remaining), 1)
+        self.assert_all_ro()
+
+    # --- target replaced between preview and deletion ------------------------
+
+    def test_file_replaced_by_directory_not_deleted(self):
+        # The reviewer's case: preview a file, swap in a directory, execute.
+        def swap(n, root_fd, rel):
+            if n == 0:
+                os.unlink(self.p("live/me/vm/big.img"))
+                os.mkdir(self.p("live/me/vm/big.img"))
+                self.write("live/me/vm/big.img/new", 10)
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=swap)
+        self.assertIn("changed since the preview", err)
+        self.assertNotEqual(code, 0)
+        self.assertTrue(self.exists("live/me/vm/big.img/new"))
+
+    def test_file_replaced_by_other_file_not_deleted(self):
+        def swap(n, root_fd, rel):
+            if n == 0:
+                os.rename(self.p("live/me/keep.txt"), self.p("live/me/vm/big.img"))
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=swap)
+        self.assertIn("changed since the preview", err)
+        self.assertTrue(self.exists("live/me/vm/big.img"))
+
+    def test_snapshot_copy_still_deleted_when_live_was_replaced(self):
+        self.snapshot("s1")
+
+        def swap(n, root_fd, rel):
+            if n == 0:
+                os.unlink(self.p("live/me/vm/big.img"))
+                self.write("live/me/vm/big.img", 10)
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=swap)
+        self.assertTrue(self.exists("live/me/vm/big.img"))       # replacement kept
+        self.assertFalse(self.exists("snaps/s1/me/vm/big.img"))  # planned copy gone
         self.assert_all_ro()
 
     # --- btrbk.conf ---------------------------------------------------------

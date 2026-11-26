@@ -376,23 +376,29 @@ def plan(arg, snapdirs, include_live):
                 seen_uuids.add(s.uuid)
                 subvols.append(s)
 
-    targets = []  # (subvol, target, access denied?)
+    targets = []  # (subvol, target, identity or None if access denied)
     for s in subvols:
         t = os.path.join(s.path, rel)
         try:
-            os.lstat(t)
+            st = os.lstat(t)
         except PermissionError:
-            targets.append((s, t, True))
+            targets.append((s, t, None))
         except (FileNotFoundError, NotADirectoryError):
             pass
         else:
-            targets.append((s, t, False))
+            targets.append((s, t, identity(st)))
     return p, rel, live, in_snapshot, sorted(seen_dirs), len(subvols), targets
 
 
-def check_target(s, rel, t, denied):
+def identity(st):
+    """What must still match at deletion time: inode number and file type.
+    (btrfs allocates inode numbers increasingly, so a replacement differs.)"""
+    return st.st_ino, stat.S_IFMT(st.st_mode)
+
+
+def check_target(s, rel, t, ident):
     """Return (reason to skip or None, allocated size, size incomplete?)."""
-    if denied:
+    if ident is None:
         return "permission denied, can't tell if it exists (run as root)", 0, False
     if s.received_uuid != NULL_UUID:
         return "received snapshot (send/receive target), not touched", 0, False
@@ -409,7 +415,7 @@ def check_target(s, rel, t, denied):
 
 def build_work(paths, snapdirs, include_live, exclude=frozenset(), quiet=False):
     """Plan all paths. Returns (work items, total size). Work items are
-    (subvol, rel, target, is_live), live copies first: if btrbk snapshots the
+    (subvol, rel, target, is_live, identity), live copies first: if btrbk snapshots the
     live subvolume during the run, the new snapshot won't contain the item."""
     out = (lambda *a, **k: None) if quiet else print
     work, total = [], 0
@@ -429,14 +435,14 @@ def build_work(paths, snapdirs, include_live, exclude=frozenset(), quiet=False):
         if in_snapshot and include_live:
             out(f"  live subvolume: {live or 'not found (not an ancestor of the snapshot, not mounted); skipped'}")
         out(f"  {len(targets)} of {n_subvols} subvolumes contain it (or might):")
-        for s, t, denied in targets:
-            skip, size, incomplete = check_target(s, rel, t, denied)
+        for s, t, ident in targets:
+            skip, size, incomplete = check_target(s, rel, t, ident)
             flags = ["ro"] if s.readonly else []
             mark = (f"SKIP: {skip}" if skip else
                     f">= {human(size)}, some dirs unreadable" if incomplete else human(size))
             out(f"    {'[' + ','.join(flags) + ']':5} {t}  ({mark})")
             if not skip:
-                work.append((s, rel, t, s.path == live))
+                work.append((s, rel, t, s.path == live, ident))
                 total += size
         if not targets:
             out("    (nothing found)")
@@ -467,11 +473,12 @@ def _rmtree_at(parent_fd, name, dev):
     os.rmdir(name, dir_fd=parent_fd)
 
 
-def remove_at(root_fd, rel):
+def remove_at(root_fd, rel, expect=None):
     """Delete rel below the subvolume root open as root_fd, without following
     symlinks or leaving the subvolume: walk to the parent with O_NOFOLLOW dir
     fds, check each stays on the subvolume's device, then delete relative to
-    that fd."""
+    that fd. If expect (an identity()) is given, the target must still be
+    that same file, else nothing is deleted."""
     parts = rel.split("/")
     if not parts or any(c in ("", ".", "..") for c in parts):
         raise ValueError(f"bad relative path {rel!r}")
@@ -486,6 +493,9 @@ def remove_at(root_fd, rel):
                 raise OSError(f"{comp}: crosses into another subvolume/mount")
         name = parts[-1]
         st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if expect is not None and identity(st) != expect:
+            raise OSError(f"{name}: changed since the preview (another file now), "
+                          "not deleted")
         if stat.S_ISDIR(st.st_mode):
             _rmtree_at(fd, name, dev)
         else:
@@ -511,7 +521,7 @@ def _restore_ro(s, fd):
         raise
 
 
-def delete_in(s, rel):
+def delete_in(s, rel, expect=None):
     """Delete rel inside subvolume s, making it writable temporarily.
 
     Works on an fd of the subvolume root, verified to be the planned
@@ -534,7 +544,7 @@ def delete_in(s, rel):
         try:
             if cur.readonly:
                 set_ro_fd(fd, False)
-            remove_at(fd, rel)
+            remove_at(fd, rel, expect)
         finally:
             if cur.readonly and not Subvol(s.path, fd).readonly:
                 _restore_ro(s, fd)
@@ -559,11 +569,11 @@ def _request_stop(signum, frame):
 def run_work(work):
     """Delete all work items. Returns (done, failed) sets of (uuid, rel)."""
     done, failed = set(), set()
-    for s, rel, t, _ in work:
+    for s, rel, t, _, ident in work:
         if _stop_requested:
             sys.exit("stopped; remaining items were not touched")
         try:
-            delete_in(s, rel)
+            delete_in(s, rel, ident)
             print(f"deleted {t}")
             done.add((s.uuid, rel))
         except Gone:
@@ -650,7 +660,7 @@ def main():
         if not work:
             break
         print(f"\n{len(work)} item(s) appeared during the run (new snapshots?):")
-        for _, _, t, _ in work:
+        for _, _, t, _, _ in work:
             print(f"    {t}")
         if not args.yes and not confirm("Delete these too? [y/N] "):
             break
