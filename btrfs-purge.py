@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
 btrfs-purge: delete a file or directory from a btrfs subvolume AND from every
-snapshot of that subvolume (e.g. btrbk snapshots in /var/.snapshot).
+snapshot of that subvolume (e.g. btrbk snapshots in /var/.snapshots).
 
 PATH may point into the live filesystem (the file may already be gone there,
 as long as its parent directory exists) or into a snapshot, e.g.
-    btrfs-purge.py /home/me/big.iso
-    btrfs-purge.py /var/.snapshot/home.20261101T0000/me/old-vm-images
+    btrfs-purge.py /var/home/me/big.iso
+    btrfs-purge.py /var/.snapshots/home.20261101T0000/me/old-vm-images
 
 Matching is by path relative to the subvolume root. "Same subvolume" is
 determined by UUID: a snapshot belongs to a source if its parent_uuid equals
-the source's uuid. Read-only snapshots are temporarily made writable and are
-always set read-only again afterwards. Needs Python >= 3.11 (stdlib only) plus
-the btrfs command (for toggling read-only). Run as root.
+the source's uuid. Snapshot directories are read from btrbk.conf, plus -s DIR,
+plus <subvolume root>/.snapshots.
 
-Deletion is done through directory file descriptors opened with O_NOFOLLOW
-from the subvolume root (verified by UUID), so a path component swapped for a
-symlink, or a subvolume replaced, after planning makes the deletion fail
-instead of escaping. Recursive deletion never descends into another
-subvolume or mount.
+Read-only snapshots are temporarily made writable and always set read-only
+again afterwards. Everything is done through file descriptors and btrfs
+ioctls: the subvolume root is opened once and verified by UUID, the ro flag is
+toggled on that fd, and deletion walks from it with O_NOFOLLOW, never leaving
+the subvolume. A path swapped for a symlink, or a snapshot replaced, after
+planning makes the deletion fail instead of escaping.
 
+If btrbk creates snapshots during the run, live copies are deleted first and a
+rescan at the end catches new snapshots that still contain the item.
+
+Needs Python >= 3.11, stdlib only; no btrfs-progs needed. Run as root.
 Default is to show the plan and ask. Use -n for dry run, -y to skip the prompt.
 """
 
@@ -30,24 +34,37 @@ import re
 import signal
 import stat
 import struct
-import subprocess
 import sys
 import uuid as uuidlib
 
 if sys.version_info < (3, 11):
     sys.exit("error: needs Python >= 3.11")
 
-DEFAULT_SNAPSHOT_DIR = "/var/.snapshot"
+BTRBK_CONF = "/etc/btrbk/btrbk.conf"
 BLOCKING_PROCS = {"borg", "borgmatic", "btrbk"}
+MAX_RESCANS = 3
 
-# --- btrfs subvolume info via ioctl (no root needed, no output parsing) -----
+# --- btrfs ioctls (no root needed for reading, no output parsing) -----------
 
 _INFO_SIZE = 504  # sizeof(struct btrfs_ioctl_get_subvol_info_args)
 BTRFS_IOC_GET_SUBVOL_INFO = (2 << 30) | (_INFO_SIZE << 16) | (0x94 << 8) | 60
-BTRFS_ROOT_SUBVOL_RDONLY = 1 << 0
+BTRFS_IOC_SUBVOL_GETFLAGS = (2 << 30) | (8 << 16) | (0x94 << 8) | 25
+BTRFS_IOC_SUBVOL_SETFLAGS = (1 << 30) | (8 << 16) | (0x94 << 8) | 26
+BTRFS_ROOT_SUBVOL_RDONLY = 1 << 0  # in subvol info flags
+BTRFS_SUBVOL_RDONLY = 1 << 1       # in GET/SETFLAGS flags
 BTRFS_SUBVOL_ROOT_INO = 256
-BTRFS_EMPTY_SUBVOL_DIR_INO = 2  # placeholder for a nested subvol inside a snapshot
+BTRFS_EMPTY_SUBVOL_DIR_INO = 2     # placeholder for a nested subvol inside a snapshot
 NULL_UUID = uuidlib.UUID(int=0)
+
+_NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+class PlanError(Exception):
+    pass
+
+
+class Gone(Exception):
+    """The snapshot disappeared during the run (e.g. btrbk rotation)."""
 
 
 class Subvol:
@@ -73,6 +90,23 @@ class Subvol:
         return self.path
 
 
+def set_ro_fd(fd, value):
+    """Set or clear the read-only flag of the subvolume open as fd."""
+    buf = bytearray(8)
+    fcntl.ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, buf)
+    (flags,) = struct.unpack("Q", buf)
+    flags = flags | BTRFS_SUBVOL_RDONLY if value else flags & ~BTRFS_SUBVOL_RDONLY
+    fcntl.ioctl(fd, BTRFS_IOC_SUBVOL_SETFLAGS, struct.pack("Q", flags))
+
+
+def set_ro(path, value):
+    fd = os.open(path, _NOFOLLOW_DIR)
+    try:
+        set_ro_fd(fd, value)
+    finally:
+        os.close(fd)
+
+
 def is_subvol_root(path):
     try:
         st = os.lstat(path)
@@ -88,7 +122,7 @@ def find_subvol_root(path):
         if is_subvol_root(p):
             return p
         if p == "/":
-            sys.exit(f"error: {path} is not on btrfs (no subvolume root found)")
+            raise PlanError(f"{path} is not on btrfs (no subvolume root found)")
         p = os.path.dirname(p)
 
 
@@ -135,6 +169,41 @@ def find_live_subvol(source_uuid, snapshot_root):
             except OSError:
                 pass
     return None
+
+
+def btrbk_snapshot_dirs(conf):
+    """Snapshot directories configured in btrbk.conf: each volume's
+    snapshot_dir (relative ones are relative to the volume), or the volume
+    directory itself if none is set (btrbk's default)."""
+    try:
+        with open(conf) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    dirs, global_sd, volume, vol_has_sd = [], None, None, False
+
+    def close_volume():
+        if volume is not None and not vol_has_sd and global_sd is None:
+            dirs.append(volume)
+
+    for line in lines:
+        words = line.split("#", 1)[0].split(None, 1)
+        if len(words) != 2:
+            continue
+        key, val = words[0], words[1].strip()
+        if key == "volume":
+            close_volume()
+            volume, vol_has_sd = val, False
+            if global_sd is not None:
+                dirs.append(os.path.join(volume, global_sd))
+        elif key == "snapshot_dir":
+            if volume is None:
+                global_sd = val
+            else:
+                vol_has_sd = True
+                dirs.append(os.path.join(volume, val))  # absolute val wins
+    close_volume()
+    return list(dict.fromkeys(os.path.normpath(d) for d in dirs))
 
 
 # --- safety checks ----------------------------------------------------------
@@ -208,29 +277,56 @@ def human(n):
 
 # --- planning ---------------------------------------------------------------
 
+def resolve_arg(arg):
+    """Absolute path of arg with symlinks in the parent resolved *before* any
+    '..' is applied (as the kernel does), but the last component kept as is,
+    so a symlink argument means the link itself. Trailing slashes are fine."""
+    a = arg.rstrip("/")
+    if not a:
+        raise PlanError("refusing to work on /")
+    if not os.path.isabs(a):
+        a = os.path.join(os.getcwd(), a)  # no normpath: it would apply '..' early
+    name = os.path.basename(a)
+    if name in (".", ".."):
+        raise PlanError(f"refusing ambiguous path {arg!r}")
+    parent = os.path.realpath(os.path.dirname(a))
+    return parent, name
+
+
+def is_snapshot(root, info, snapdirs):
+    """Whether the subvolume at root is a snapshot rather than a live source."""
+    if info.parent_uuid == NULL_UUID:
+        return False
+    if info.readonly:
+        return True
+    # Writable, but has a parent: a snapshot if it lives in a snapshot dir.
+    # (A live subvolume restored from a snapshot also has a parent uuid.)
+    in_snapdir = lambda d: d in snapdirs or os.path.basename(d) == ".snapshots"
+    d = os.path.dirname(root)
+    if in_snapdir(d):
+        return True
+    # snapper layout: <snapdir>/N/snapshot
+    return os.path.basename(root) == "snapshot" and in_snapdir(os.path.dirname(d))
+
+
 def plan(arg, snapdirs, include_live):
-    # Resolve symlinks in the parent only: a symlink argument deletes the link.
-    p = os.path.abspath(arg)
-    parent = os.path.realpath(os.path.dirname(p))
-    name = os.path.basename(p)
-    if name in ("", ".", ".."):
-        sys.exit(f"error: refusing ambiguous path {arg!r}")
+    parent, name = resolve_arg(arg)
     try:
         if not stat.S_ISDIR(os.stat(parent).st_mode):
             raise NotADirectoryError
     except PermissionError:
-        sys.exit(f"error: cannot access {parent}: permission denied (run as root)")
+        raise PlanError(f"cannot access {parent}: permission denied (run as root)")
     except (FileNotFoundError, NotADirectoryError):
-        sys.exit(f"error: parent directory {parent} does not exist")
+        raise PlanError(f"parent directory {parent} does not exist")
     p = os.path.join(parent, name)
     if is_subvol_root(p):
-        sys.exit(f"error: {p} is a subvolume itself; use 'btrfs subvolume delete'")
+        raise PlanError(f"{p} is a subvolume itself; use 'btrfs subvolume delete'")
 
+    known = {os.path.realpath(d) for d in snapdirs}
     root = find_subvol_root(parent)
     rel = os.path.relpath(p, root)
     info = Subvol(root)
-    # A read-only subvolume with a parent is a snapshot (btrbk makes them ro).
-    in_snapshot = info.readonly and info.parent_uuid != NULL_UUID
+    in_snapshot = is_snapshot(root, info, known)
     dirs = list(snapdirs)
 
     if in_snapshot:
@@ -248,6 +344,8 @@ def plan(arg, snapdirs, include_live):
 
     seen_dirs, seen_uuids = set(), set()
     subvols = [Subvol(live)] if live else []
+    if live:
+        seen_uuids.add(subvols[0].uuid)
     for d in dirs:
         d = os.path.realpath(d)
         if d in seen_dirs or not os.path.isdir(d):
@@ -270,7 +368,10 @@ def plan(arg, snapdirs, include_live):
                 except OSError:
                     pass
         for c in candidates:
-            s = Subvol(c)
+            try:
+                s = Subvol(c)
+            except OSError:
+                continue  # vanished meanwhile, or not readable
             if s.parent_uuid == source_uuid and s.uuid not in seen_uuids:
                 seen_uuids.add(s.uuid)
                 subvols.append(s)
@@ -306,21 +407,49 @@ def check_target(s, rel, t, denied):
     return None, size, incomplete
 
 
+def build_work(paths, snapdirs, include_live, exclude=frozenset(), quiet=False):
+    """Plan all paths. Returns (work items, total size). Work items are
+    (subvol, rel, target, is_live), live copies first: if btrbk snapshots the
+    live subvolume during the run, the new snapshot won't contain the item."""
+    out = (lambda *a, **k: None) if quiet else print
+    work, total = [], 0
+    for arg in paths:
+        try:
+            p, rel, live, in_snapshot, searched, n_subvols, targets = plan(
+                arg, snapdirs, include_live)
+        except PlanError as e:
+            if quiet:
+                continue
+            raise
+        targets = [x for x in targets if (x[0].uuid, rel) not in exclude]
+        if quiet and not targets:
+            continue
+        out(f"\n{p}\n  relative path: {rel}")
+        out(f"  snapshot dirs: {', '.join(searched) or '(none found)'}")
+        if in_snapshot and include_live:
+            out(f"  live subvolume: {live or 'not found (not an ancestor of the snapshot, not mounted); skipped'}")
+        out(f"  {len(targets)} of {n_subvols} subvolumes contain it (or might):")
+        for s, t, denied in targets:
+            skip, size, incomplete = check_target(s, rel, t, denied)
+            flags = ["ro"] if s.readonly else []
+            mark = (f"SKIP: {skip}" if skip else
+                    f">= {human(size)}, some dirs unreadable" if incomplete else human(size))
+            out(f"    {'[' + ','.join(flags) + ']':5} {t}  ({mark})")
+            if not skip:
+                work.append((s, rel, t, s.path == live))
+                total += size
+        if not targets:
+            out("    (nothing found)")
+    work.sort(key=lambda w: not w[3])  # stable: live copies first
+    return work, total
+
+
 # --- deletion ---------------------------------------------------------------
-
-def set_ro(path, value):
-    # Own process group: a Ctrl-C at the terminal must not kill btrfs midway.
-    subprocess.run(["btrfs", "property", "set", "-ts", path, "ro",
-                    "true" if value else "false"], check=True, process_group=0)
-
-
-_NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-
 
 def _rmtree_at(parent_fd, name, dev):
     """Recursively delete parent_fd/name like rm -r, but fd-based (never
-    follows symlinks) and never descending into another subvolume or mount
-    (different st_dev). Empty nested-subvolume placeholders are removed."""
+    follows symlinks) and never descending into another subvolume (different
+    st_dev). Empty nested-subvolume placeholders are removed."""
     fd = os.open(name, _NOFOLLOW_DIR, dir_fd=parent_fd)  # ELOOP if now a symlink
     try:
         st = os.fstat(fd)
@@ -366,17 +495,18 @@ def remove_at(root_fd, rel):
 
 
 def _restore_ro(s, fd):
-    """Make the subvolume open as fd read-only again (via its path, for the
-    btrfs command) and verify through fd that it worked."""
+    """Make the subvolume open as fd read-only again and verify it."""
     try:
-        if Subvol(s.path).uuid != s.uuid:
-            raise OSError(f"{s.path} now is a different subvolume")
-        set_ro(s.path, True)
+        set_ro_fd(fd, True)
         if not Subvol(s.path, fd).readonly:
             raise OSError("still writable after setting ro")
     except Exception as e:
+        if not os.path.lexists(s.path):
+            print(f"note: {s.path} disappeared while writable (btrbk rotation?)",
+                  file=sys.stderr)
+            return
         print(f"!!! FAILED to make {s.path} (uuid {s.uuid}) read-only again: {e}\n"
-              f"!!! fix manually: btrfs property set -ts <its path> ro true",
+              f"!!! fix manually: btrfs property set -ts {s.path} ro true",
               file=sys.stderr)
         raise
 
@@ -385,33 +515,33 @@ def delete_in(s, rel):
     """Delete rel inside subvolume s, making it writable temporarily.
 
     Works on an fd of the subvolume root, verified to be the planned
-    subvolume (uuid), so a path replaced after planning is never used for
-    deleting. The btrfs command needs a path; the ro flag it sets is verified
-    through the fd before deleting and after restoring."""
+    subvolume (uuid); the ro flag is toggled on that same fd. So a path
+    replaced after planning is never written to."""
     t = os.path.join(s.path, rel)
     m = mount_conflict(s.path, t)  # re-check now, not only at planning time
     if m:
         raise OSError(f"mount point {m} on or below the path")
-    fd = os.open(s.path, _NOFOLLOW_DIR)
+    try:
+        fd = os.open(s.path, _NOFOLLOW_DIR)
+    except FileNotFoundError:
+        raise Gone(s.path)
     try:
         cur = Subvol(s.path, fd)
         if cur.uuid != s.uuid:
             raise OSError(f"{s.path} is no longer the planned subvolume (uuid changed)")
         if cur.received_uuid != NULL_UUID:
             raise OSError(f"{s.path} is a received snapshot")
-        if not cur.readonly:
-            remove_at(fd, rel)
-            return
         try:
-            if Subvol(s.path).uuid != s.uuid:
-                raise OSError(f"{s.path} is no longer the planned subvolume (uuid changed)")
-            set_ro(s.path, False)
-            if Subvol(s.path, fd).readonly:
-                raise OSError(f"{s.path} still read-only after making it writable")
+            if cur.readonly:
+                set_ro_fd(fd, False)
             remove_at(fd, rel)
         finally:
-            if not Subvol(s.path, fd).readonly:
+            if cur.readonly and not Subvol(s.path, fd).readonly:
                 _restore_ro(s, fd)
+    except Exception as e:
+        if not isinstance(e, Gone) and not os.path.lexists(s.path):
+            raise Gone(s.path) from e
+        raise
     finally:
         os.close(fd)
 
@@ -426,57 +556,76 @@ def _request_stop(signum, frame):
           "(its snapshot is restored to read-only first)", file=sys.stderr)
 
 
+def run_work(work):
+    """Delete all work items. Returns (done, failed) sets of (uuid, rel)."""
+    done, failed = set(), set()
+    for s, rel, t, _ in work:
+        if _stop_requested:
+            sys.exit("stopped; remaining items were not touched")
+        try:
+            delete_in(s, rel)
+            print(f"deleted {t}")
+            done.add((s.uuid, rel))
+        except Gone:
+            print(f"gone    {t} (snapshot disappeared, rotated away by btrbk?)")
+            done.add((s.uuid, rel))
+        except Exception as e:
+            failed.add((s.uuid, rel))
+            print(f"FAILED  {t}: {e}", file=sys.stderr)
+    if _stop_requested:
+        sys.exit("stopped after the last item")
+    return done, failed
+
+
+def confirm(prompt):
+    if not sys.stdin.isatty():
+        sys.exit("error: not a terminal; use -y to confirm")
+    try:
+        answer = input(prompt)
+    except (KeyboardInterrupt, EOFError):
+        answer = ""
+    return answer.strip().lower() in ("y", "yes")
+
+
+def check_blocking():
+    procs = blocking_processes()
+    if procs:
+        sys.exit("error: refusing to run while these are active: " + ", ".join(procs))
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Delete a file/dir from a btrfs subvolume and all its snapshots.")
     ap.add_argument("paths", nargs="+", metavar="PATH")
-    ap.add_argument("-s", "--snapshot-dir", action="append", dest="snapshot_dirs",
-                    metavar="DIR",
-                    help=f"directory holding snapshots; repeatable (default {DEFAULT_SNAPSHOT_DIR}). "
-                         "Also searched automatically: <subvolume root>/.snapshots and the "
-                         "directory of the snapshot PATH points into")
+    ap.add_argument("-s", "--snapshot-dir", action="append", default=[],
+                    dest="snapshot_dirs", metavar="DIR",
+                    help="additional directory holding snapshots; repeatable. Always "
+                         "searched: snapshot dirs from btrbk.conf, <subvolume root>/"
+                         ".snapshots, and the directory of the snapshot PATH points into")
+    ap.add_argument("--btrbk-conf", default=BTRBK_CONF, metavar="FILE",
+                    help=f"btrbk config to read snapshot dirs from (default {BTRBK_CONF}; "
+                         "ignored if missing)")
     ap.add_argument("-n", "--dry-run", action="store_true", help="only show what would be deleted")
     ap.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     ap.add_argument("--snapshots-only", action="store_true",
                     help="leave the live filesystem alone, only purge snapshots")
     args = ap.parse_args()
 
-    if args.snapshot_dirs:
-        for d in args.snapshot_dirs:
-            if not os.path.isdir(d):
-                sys.exit(f"error: snapshot dir {d} does not exist")
-        snapdirs = args.snapshot_dirs
-    else:
-        snapdirs = [DEFAULT_SNAPSHOT_DIR]  # silently skipped if absent
+    for d in args.snapshot_dirs:
+        if not os.path.isdir(d):
+            sys.exit(f"error: snapshot dir {d} does not exist")
+    snapdirs = btrbk_snapshot_dirs(args.btrbk_conf) + args.snapshot_dirs
+    include_live = not args.snapshots_only
 
-    procs = blocking_processes()
-    if procs:
-        sys.exit("error: refusing to run while these are active: " + ", ".join(procs))
+    check_blocking()
     if os.geteuid() != 0:
         print("note: not root; paths you can't read show as 'permission denied' "
               "and sizes may be incomplete", file=sys.stderr)
 
-    work, total = [], 0
-    for arg in args.paths:
-        p, rel, live, in_snapshot, searched, n_subvols, targets = plan(
-            arg, snapdirs, not args.snapshots_only)
-        print(f"\n{p}\n  relative path: {rel}")
-        print(f"  snapshot dirs: {', '.join(searched) or '(none found)'}")
-        if in_snapshot and not args.snapshots_only:
-            print(f"  live subvolume: {live or 'not found (not an ancestor of the snapshot, not mounted); skipped'}")
-        print(f"  {len(targets)} of {n_subvols} subvolumes contain it (or might):")
-        for s, t, denied in targets:
-            skip, size, incomplete = check_target(s, rel, t, denied)
-            flags = ["ro"] if s.readonly else []
-            mark = (f"SKIP: {skip}" if skip else
-                    f">= {human(size)}, some dirs unreadable" if incomplete else human(size))
-            print(f"    {'[' + ','.join(flags) + ']':5} {t}  ({mark})")
-            if not skip:
-                work.append((s, rel, t))
-                total += size
-        if not targets:
-            print("    (nothing found)")
-
+    try:
+        work, total = build_work(args.paths, snapdirs, include_live)
+    except PlanError as e:
+        sys.exit(f"error: {e}")
     if not work:
         print("\nNothing to delete.")
         return
@@ -484,39 +633,35 @@ def main():
           "(shared extents counted once per snapshot; actual space freed may be less).")
     if args.dry_run:
         return
-    if not args.yes:
-        if not sys.stdin.isatty():
-            sys.exit("error: not a terminal; use -y to confirm")
-        try:
-            answer = input("Delete? [y/N] ")
-        except (KeyboardInterrupt, EOFError):
-            answer = ""
-        if answer.strip().lower() not in ("y", "yes"):
-            sys.exit("\naborted")
-
-    # Re-check right before acting: borg may have started while we waited.
-    procs = blocking_processes()
-    if procs:
-        sys.exit("error: refusing to run while these are active: " + ", ".join(procs))
+    if not args.yes and not confirm("Delete? [y/N] "):
+        sys.exit("aborted")
+    check_blocking()  # borg may have started while we waited
 
     # From here on, signals only request a stop between items, so a snapshot
     # is never left writable by an interruption.
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _request_stop)
-    failed = 0
-    for s, rel, t in work:
-        if _stop_requested:
-            sys.exit("stopped; remaining items were not touched")
-        try:
-            delete_in(s, rel)
-            print(f"deleted {t}")
-        except Exception as e:
-            failed += 1
-            print(f"FAILED  {t}: {e}", file=sys.stderr)
-    if _stop_requested:
-        sys.exit("stopped after the last item")
+    done, failed = run_work(work)
+
+    # btrbk may have taken a snapshot while we were deleting: look again.
+    for _ in range(MAX_RESCANS):
+        work, total = build_work(args.paths, snapdirs, include_live,
+                                 exclude=done | failed, quiet=True)
+        if not work:
+            break
+        print(f"\n{len(work)} item(s) appeared during the run (new snapshots?):")
+        for _, _, t, _ in work:
+            print(f"    {t}")
+        if not args.yes and not confirm("Delete these too? [y/N] "):
+            break
+        d, f = run_work(work)
+        done |= d
+        failed |= f
+    else:
+        print("warning: new copies kept appearing; run again later", file=sys.stderr)
+
     if failed:
-        sys.exit(f"{failed} deletion(s) failed")
+        sys.exit(f"{len(failed)} deletion(s) failed")
     print("done. Space is reclaimed by btrfs in the background (btrfs-cleaner).")
 
 

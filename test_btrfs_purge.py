@@ -92,11 +92,43 @@ class PurgeTest(unittest.TestCase):
         return path
 
     def run_purge(self, *args, ok=True):
+        # Ignore the real /etc/btrbk/btrbk.conf unless a test passes its own.
+        if "--btrbk-conf" not in args:
+            args = ("--btrbk-conf", os.devnull, *args)
         r = subprocess.run([sys.executable, SCRIPT, *args], cwd=self.d,
                            capture_output=True, text=True, stdin=subprocess.DEVNULL)
         if ok:
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r
+
+    def run_main(self, *args, hook=None):
+        """Run main() in-process; hook(n, root_fd, rel) is called before the
+        n-th deletion (n from 0). Returns (exit code, stdout, stderr)."""
+        orig_remove, orig_argv = bp.remove_at, sys.argv
+        handlers = {sig: signal.getsignal(sig)
+                    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        calls = []
+
+        def wrapped(root_fd, rel):
+            if hook:
+                hook(len(calls), root_fd, rel)
+            calls.append(rel)
+            orig_remove(root_fd, rel)
+
+        bp.remove_at = wrapped
+        sys.argv = ["btrfs-purge", "--btrbk-conf", os.devnull, *args]
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                bp.main()
+        except SystemExit as e:
+            code = e.code
+        finally:
+            bp.remove_at, sys.argv = orig_remove, orig_argv
+            for sig, h in handlers.items():
+                signal.signal(sig, h)
+            bp._stop_requested = False
+        return code, out.getvalue(), err.getvalue()
 
     def exists(self, rel):
         return os.path.lexists(self.p(rel))
@@ -409,34 +441,150 @@ class PurgeTest(unittest.TestCase):
     def test_interrupt_stops_between_items_and_restores_ro(self):
         self.snapshot("s1")
         self.snapshot("s2")
-        orig_remove, orig_argv = bp.remove_at, sys.argv
-        handlers = {sig: signal.getsignal(sig)
-                    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
         calls = []
 
-        def remove_then_interrupt(root, rel):
-            calls.append(root)
-            orig_remove(root, rel)
+        def interrupt(n, root_fd, rel):
+            calls.append(n)
             os.kill(os.getpid(), signal.SIGINT)  # Ctrl-C in the middle of item 1
 
-        bp.remove_at = remove_then_interrupt
-        sys.argv = ["btrfs-purge", "-y", "--snapshots-only",
-                    "-s", self.snaps, self.p("live/me/vm/big.img")]
-        try:
-            with self.assertRaises(SystemExit) as cm, \
-                    contextlib.redirect_stdout(io.StringIO()), \
-                    contextlib.redirect_stderr(io.StringIO()):
-                bp.main()
-        finally:
-            bp.remove_at, sys.argv = orig_remove, orig_argv
-            for sig, h in handlers.items():
-                signal.signal(sig, h)
-            bp._stop_requested = False
-        self.assertIn("stopped", str(cm.exception.code))
-        self.assertEqual(len(calls), 1)
+        code, out, err = self.run_main("-y", "--snapshots-only", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=interrupt)
+        self.assertIn("stopped", str(code))
+        self.assertEqual(calls, [0])
         remaining = [n for n in ("s1", "s2") if self.exists(f"snaps/{n}/me/vm/big.img")]
         self.assertEqual(len(remaining), 1)
         self.assert_all_ro()
+
+    # --- btrbk.conf ---------------------------------------------------------
+
+    def write_conf(self, text):
+        path = self.p("btrbk.conf")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_btrbk_conf_parsing(self):
+        conf = self.write_conf("""
+timestamp_format        long
+snapshot_preserve       48h 7d 4w
+
+# Var
+volume /var
+  snapshot_dir /var/.snapshots
+  subvolume .
+
+# Home
+volume /var/home
+  snapshot_dir /var/.snapshots   # same dir again
+  subvolume .
+
+volume /var/home/m3
+  snapshot_dir .snapshots
+  subvolume .
+""")
+        self.assertEqual(bp.btrbk_snapshot_dirs(conf),
+                         ["/var/.snapshots", "/var/home/m3/.snapshots"])
+
+    def test_btrbk_conf_global_and_default_dirs(self):
+        conf = self.write_conf("snapshot_dir snaps\nvolume /a\nvolume /b\n"
+                               "  snapshot_dir /abs\n")
+        self.assertEqual(bp.btrbk_snapshot_dirs(conf), ["/a/snaps", "/b/snaps", "/abs"])
+        conf = self.write_conf("volume /a\n  subvolume x\nvolume /b\n  snapshot_dir s\n")
+        self.assertEqual(bp.btrbk_snapshot_dirs(conf), ["/a", "/b/s"])
+        self.assertEqual(bp.btrbk_snapshot_dirs(self.p("missing.conf")), [])
+
+    def test_btrbk_conf_used_for_discovery(self):
+        self.snapshot("s1")
+        conf = self.write_conf(f"volume {self.live}\n  snapshot_dir {self.snaps}\n"
+                               "  subvolume .\n")
+        self.run_purge("-y", "--btrbk-conf", conf, "live/me/vm/big.img")
+        self.assertFalse(self.exists("snaps/s1/me/vm/big.img"))
+
+    # --- path resolution ----------------------------------------------------
+
+    def test_symlink_then_dotdot_resolved_like_the_kernel(self):
+        # live/me/link -> ../other/sub, so live/me/link/../victim is
+        # live/other/victim for the kernel, but live/me/victim lexically.
+        os.makedirs(self.p("live/other/sub"))
+        self.write("live/other/victim", 10)
+        self.write("live/me/victim", 10)
+        os.symlink("../other/sub", self.p("live/me/link"))
+        self.snapshot("s1")
+        self.run_purge("-y", "-s", "snaps", "live/me/link/../victim")
+        self.assertFalse(self.exists("live/other/victim"))
+        self.assertFalse(self.exists("snaps/s1/other/victim"))
+        self.assertTrue(self.exists("live/me/victim"))
+        self.assertTrue(self.exists("snaps/s1/me/victim"))
+
+    def test_trailing_slash_accepted(self):
+        self.snapshot("s1")
+        self.run_purge("-y", "-s", "snaps", "live/me/vm/")
+        self.assertFalse(self.exists("live/me/vm"))
+        self.assertFalse(self.exists("snaps/s1/me/vm"))
+
+    def test_root_and_dot_refused(self):
+        for arg in ("/", "live/me/.", "live/me/.."):
+            r = self.run_purge("-n", "-s", "snaps", arg, ok=False)
+            self.assertNotEqual(r.returncode, 0, arg)
+            self.assertIn("refusing", r.stderr, arg)
+
+    def test_writable_snapshot_in_snapdir_counts_as_snapshot(self):
+        self.snapshot("s1")
+        btrfs("subvolume", "snapshot", self.live, self.p("snaps/rw"))  # writable
+        r = self.run_purge("-n", "-s", "snaps", "snaps/rw/me/vm/big.img")
+        self.assertIn("live subvolume:", r.stdout)       # treated as a snapshot
+        self.assertIn("snaps/s1/me/vm/big.img", r.stdout)  # sibling found
+
+    # --- btrbk running concurrently ------------------------------------------
+
+    def test_live_copies_deleted_first(self):
+        self.write("live/me/other.img", 10)
+        self.snapshot("s1")
+        r = self.run_purge("-y", "-s", "snaps", "live/me/vm/big.img", "live/me/other.img")
+        deleted = [l.split()[1] for l in r.stdout.splitlines() if l.startswith("deleted")]
+        self.assertEqual(len(deleted), 4)
+        self.assertTrue(all("/live/" in d for d in deleted[:2]), deleted)
+        self.assertTrue(all("/snaps/" in d for d in deleted[2:]), deleted)
+
+    def test_rescan_catches_snapshot_taken_during_run(self):
+        self.snapshot("s1")
+
+        def btrbk_snapshots(n, root_fd, rel):
+            if n == 0:  # before the live copy is gone
+                self.snapshot("late")
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=btrbk_snapshots)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("appeared during the run", out)
+        self.assertFalse(self.exists("snaps/late/me/vm/big.img"))
+        self.assert_all_ro()
+
+    def test_snapshot_rotated_away_is_not_a_failure(self):
+        self.snapshot("s1")
+        self.snapshot("s2")
+
+        def btrbk_rotates(n, root_fd, rel):
+            if n == 0:
+                remove_subvol(self.p("snaps/s2"))
+
+        code, out, err = self.run_main("-y", "-s", self.snaps,
+                                       self.p("live/me/vm/big.img"), hook=btrbk_rotates)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("gone", out)
+        self.assertNotIn("FAILED", err)
+
+    def test_snapshot_renamed_while_writable_still_restored(self):
+        # ro is restored through the fd, so it reaches the snapshot even
+        # after its path changed.
+        self.snapshot("s1")
+
+        def rename(n, root_fd, rel):
+            if n == 1:  # the snapshot (n == 0 is the live copy), now writable
+                os.rename(self.p("snaps/s1"), self.p("snaps/s1.moved"))
+
+        self.run_main("-y", "-s", self.snaps, self.p("live/me/vm/big.img"), hook=rename)
+        self.assertTrue(bp.Subvol(self.p("snaps/s1.moved")).readonly)
 
     @unittest.skipIf(os.geteuid() == 0, "root can read everything")
     def test_unreadable_reported_not_missed(self):

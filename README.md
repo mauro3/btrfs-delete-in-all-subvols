@@ -4,8 +4,8 @@ Delete a file or directory from a btrfs subvolume **and from every snapshot of
 it**, e.g. to get rid of a large file that btrbk snapshots would otherwise keep
 around for weeks.
 
-Single Python file, stdlib only (Python >= 3.11), plus the `btrfs` command
-(btrfs-progs).
+Single Python file, stdlib only (Python >= 3.11). It talks to btrfs through
+ioctls, so it doesn't even need btrfs-progs (the tests do).
 
 > [!WARNING]
 > **Do not use this if your snapshots are used for `btrfs send`/`receive`.**
@@ -44,16 +44,21 @@ Single Python file, stdlib only (Python >= 3.11), plus the `btrfs` command
 1. Finds the subvolume containing `PATH` and the path relative to its root.
 2. Finds snapshots of that subvolume: subvolumes whose `parent_uuid` equals the
    source subvolume's UUID. Snapshots are looked for in
-   - every `-s DIR` (default `/var/.snapshot`),
+   - the snapshot directories in `/etc/btrbk/btrbk.conf` (each `volume`'s
+     `snapshot_dir`, relative ones relative to the volume),
+   - every `-s DIR`,
    - `<subvolume root>/.snapshots` (e.g. `~/.snapshots`),
    - the directory of the snapshot `PATH` points into, if it does.
 
    Snapshots may sit directly in those directories (btrbk: `DIR/name.DATE`)
    or one level down (snapper: `DIR/N/snapshot`).
 3. Shows what it would delete (with sizes) and asks.
-4. For each match: makes a read-only snapshot writable, deletes, and **always**
-   makes it read-only again (also on errors). Ctrl-C, SIGTERM and SIGHUP stop
-   the run *between* snapshots, never in the middle of one.
+4. Deletes the live copies first, then the snapshot copies. For each snapshot:
+   makes it writable, deletes, and **always** makes it read-only again (also
+   on errors). Ctrl-C, SIGTERM and SIGHUP stop the run *between* snapshots,
+   never in the middle of one.
+5. Rescans, and offers to delete copies in snapshots that appeared during the
+   run (see [Running alongside btrbk](#running-alongside-btrbk)).
 
 Other subvolumes that happen to contain the same relative path are never
 touched.
@@ -61,14 +66,15 @@ touched.
 ## Usage
 
 ```
-btrfs-purge.py [-n] [-y] [-s DIR]... [--snapshots-only] PATH...
+btrfs-purge.py [-n] [-y] [-s DIR]... [--btrbk-conf FILE] [--snapshots-only] PATH...
 ```
 
 | Option | |
 |---|---|
 | `-n`, `--dry-run` | only show what would be deleted |
 | `-y`, `--yes` | don't ask for confirmation |
-| `-s DIR` | snapshot directory; repeatable (default `/var/.snapshot`) |
+| `-s DIR` | additional snapshot directory; repeatable |
+| `--btrbk-conf FILE` | btrbk config to read snapshot dirs from (default `/etc/btrbk/btrbk.conf`, ignored if missing) |
 | `--snapshots-only` | leave the live filesystem alone |
 
 Deleting needs root (btrbk snapshots are owned by root). A dry run works as a
@@ -100,14 +106,14 @@ it is removed from all sibling snapshots (and from the live subvolume, if still
 there):
 
 ```sh
-sudo btrfs-purge.py /var/.snapshot/var.20261101T0000/tmp/huge.tar
+sudo btrfs-purge.py /var/.snapshots/var.20261101T0000/tmp/huge.tar
 ```
 
-A user's home with its snapshots in `~/.snapshots` is found automatically if
-`~` is its own subvolume. Otherwise name the directory, or several:
+Snapshot directories from btrbk.conf, and `~/.snapshots` if `~` is its own
+subvolume, are found automatically. Others can be added, as many as needed:
 
 ```sh
-sudo btrfs-purge.py -s /var/.snapshot -s /home/me/.snapshots /home/me/big.iso
+sudo btrfs-purge.py -s /mnt/old-snapshots -s /srv/.snaps /home/me/big.iso
 ```
 
 Only clean the snapshots, keep the live copy:
@@ -127,11 +133,11 @@ Example output:
 ```
 /var/lib/libvirt/images/old-vm.qcow2
   relative path: lib/libvirt/images/old-vm.qcow2
-  snapshot dirs: /var/.snapshot
+  snapshot dirs: /var/.snapshots
   3 of 30 subvolumes contain it (or might):
     []    /var/lib/libvirt/images/old-vm.qcow2  (20.0 GiB)
-    [ro]  /var/.snapshot/var.20261101T0000/lib/libvirt/images/old-vm.qcow2  (20.0 GiB)
-    [ro]  /var/.snapshot/var.20261108T0000/lib/libvirt/images/old-vm.qcow2  (20.0 GiB)
+    [ro]  /var/.snapshots/var.20261101T0000/lib/libvirt/images/old-vm.qcow2  (20.0 GiB)
+    [ro]  /var/.snapshots/var.20261108T0000/lib/libvirt/images/old-vm.qcow2  (20.0 GiB)
 
 3 item(s), 60.0 GiB allocated in total (shared extents counted once per snapshot; actual space freed may be less).
 Delete? [y/N]
@@ -141,20 +147,26 @@ Delete? [y/N]
 
 - Refuses to run while `borg`, `borgmatic` or `btrbk` is running (borg
   snapshots before backing up; btrbk creates/rotates snapshots). Checked at
-  start and again right after you confirm, but it can't prevent one from
-  *starting* during the deletion.
-- Deletes through directory file descriptors opened with `O_NOFOLLOW` from
-  the subvolume root, checking at each step that it stays on the same
-  subvolume. The root itself is verified by UUID to still be the planned
-  subvolume. If a directory on the path is swapped for a symlink, or the
-  snapshot is replaced, between planning and deletion, the deletion fails
-  instead of escaping. Recursive deletion never descends into another
-  subvolume or mount, even one created after the preview.
+  start and again right after you confirm.
+- Resolves `PATH` like the kernel does: symlinks before `..`, so
+  `link/../x` means the `x` next to the link's *target*.
+- Works on file descriptors, not paths: each subvolume root is opened once
+  and verified by UUID to still be the planned subvolume, the read-only flag
+  is toggled on that descriptor (ioctl), and deletion walks from it with
+  `O_NOFOLLOW`, checking at each step that it stays on the same subvolume. If
+  a directory on the path is swapped for a symlink, or the snapshot is
+  replaced or renamed, between planning and deletion, the deletion fails
+  instead of escaping, and the read-only flag still reaches the right
+  snapshot. Recursive deletion never descends into another subvolume, even
+  one created after the preview.
 - Skips (and says why):
-  - targets that are, contain, or lie below a mount point (bind mounts on the
-    same filesystem included, via `/proc/self/mountinfo`; checked again right
-    before deleting), or that contain a nested subvolume. Empty
-    nested-subvolume placeholders inside snapshots are fine.
+  - targets that are, contain, or lie below a mount point, or that contain a
+    nested subvolume. Empty nested-subvolume placeholders inside snapshots
+    are fine. Mounts are found via `/proc/self/mountinfo` (bind mounts on the
+    same filesystem included), checked when planning and again right before
+    each deletion. A bind mount created by root *during* a deletion would not
+    be noticed. Mounts made inside other mount namespaces (bwrap, flatpak,
+    containers) are invisible to the script and can't affect it.
   - paths that go through a symlink inside a snapshot.
   - received snapshots (those with a `received_uuid`).
 - Refuses to delete a subvolume itself; use `btrfs subvolume delete` for that.
@@ -171,6 +183,23 @@ Delete? [y/N]
   repositories.
 - The live subvolume is found from a snapshot path only if it is an ancestor of
   the snapshot directory or is mounted somewhere.
+- A writable subvolume with a parent UUID counts as a snapshot only if it sits
+  in a known snapshot directory (btrbk.conf, `-s`, or one named `.snapshots`).
+  Elsewhere it is taken as a live subvolume, as one restored from a snapshot
+  would be.
+
+## Running alongside btrbk
+
+btrbk may run while this does, e.g. from a timer (`systemctl cat btrbk.timer`
+shows when). That is safe:
+
+- A snapshot btrbk takes during the run can't get a copy that was already
+  deleted from the live subvolume, and live copies are deleted first. If one
+  still slipped in, the rescan at the end finds it and offers to delete it
+  (or just does, with `-y`).
+- A snapshot btrbk rotates away during the run is reported as `gone`, not as
+  a failure.
+- A snapshot is writable only for the moment its copy is deleted.
 
 ## Tests
 
