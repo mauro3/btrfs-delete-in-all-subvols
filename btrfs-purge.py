@@ -15,8 +15,10 @@ always set read-only again afterwards. Needs Python >= 3.11 (stdlib only) plus
 the btrfs command (for toggling read-only). Run as root.
 
 Deletion is done through directory file descriptors opened with O_NOFOLLOW
-from the subvolume root, so a path component swapped for a symlink after
-planning makes the deletion fail instead of escaping the subvolume.
+from the subvolume root (verified by UUID), so a path component swapped for a
+symlink, or a subvolume replaced, after planning makes the deletion fail
+instead of escaping. Recursive deletion never descends into another
+subvolume or mount.
 
 Default is to show the plan and ask. Use -n for dry run, -y to skip the prompt.
 """
@@ -25,7 +27,6 @@ import argparse
 import fcntl
 import os
 import re
-import shutil
 import signal
 import stat
 import struct
@@ -50,14 +51,18 @@ NULL_UUID = uuidlib.UUID(int=0)
 
 
 class Subvol:
-    def __init__(self, path):
+    def __init__(self, path, fd=None):
+        """Read subvolume info of path, or of the open directory fd if given."""
         self.path = path
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        own_fd = fd is None
+        if own_fd:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
         try:
             buf = bytearray(_INFO_SIZE)
             fcntl.ioctl(fd, BTRFS_IOC_GET_SUBVOL_INFO, buf)
         finally:
-            os.close(fd)
+            if own_fd:
+                os.close(fd)
         (self.treeid,) = struct.unpack_from("Q", buf, 0)
         (flags,) = struct.unpack_from("Q", buf, 288)
         self.readonly = bool(flags & BTRFS_ROOT_SUBVOL_RDONLY)
@@ -101,8 +106,9 @@ def mount_conflict(subvol_root, target, mounts=None):
     """A mount point that is the target, inside it, or on the path between the
     subvolume root and the target (bind mounts included), else None."""
     root = os.path.realpath(subvol_root)
+    prefix = root.rstrip("/") + "/"  # "/" -> "/", not "//"
     for m in mountpoints() if mounts is None else mounts:
-        if m == root or not m.startswith(root + "/"):
+        if m == root or not m.startswith(prefix):
             continue
         if m == target or m.startswith(target + "/") or target.startswith(m + "/"):
             return m
@@ -311,14 +317,36 @@ def set_ro(path, value):
 _NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-def remove_at(subvol_root, rel):
-    """Delete subvol_root/rel without following symlinks or leaving the
-    subvolume: walk to the parent with O_NOFOLLOW dir fds, check each stays
-    on the subvolume's device, then unlink/rmtree relative to that fd."""
+def _rmtree_at(parent_fd, name, dev):
+    """Recursively delete parent_fd/name like rm -r, but fd-based (never
+    follows symlinks) and never descending into another subvolume or mount
+    (different st_dev). Empty nested-subvolume placeholders are removed."""
+    fd = os.open(name, _NOFOLLOW_DIR, dir_fd=parent_fd)  # ELOOP if now a symlink
+    try:
+        st = os.fstat(fd)
+        if st.st_dev != dev and st.st_ino != BTRFS_EMPTY_SUBVOL_DIR_INO:
+            raise OSError(f"{name}: is another subvolume/mount, not descending")
+        with os.scandir(fd) as it:
+            entries = list(it)
+        for e in entries:
+            if e.is_dir(follow_symlinks=False):
+                _rmtree_at(fd, e.name, dev)
+            else:
+                os.unlink(e.name, dir_fd=fd)  # EISDIR if swapped for a dir
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def remove_at(root_fd, rel):
+    """Delete rel below the subvolume root open as root_fd, without following
+    symlinks or leaving the subvolume: walk to the parent with O_NOFOLLOW dir
+    fds, check each stays on the subvolume's device, then delete relative to
+    that fd."""
     parts = rel.split("/")
     if not parts or any(c in ("", ".", "..") for c in parts):
         raise ValueError(f"bad relative path {rel!r}")
-    fd = os.open(subvol_root, _NOFOLLOW_DIR)
+    fd = os.dup(root_fd)
     try:
         dev = os.fstat(fd).st_dev
         for comp in parts[:-1]:
@@ -330,35 +358,62 @@ def remove_at(subvol_root, rel):
         name = parts[-1]
         st = os.stat(name, dir_fd=fd, follow_symlinks=False)
         if stat.S_ISDIR(st.st_mode):
-            if st.st_dev != dev and st.st_ino != BTRFS_EMPTY_SUBVOL_DIR_INO:
-                raise OSError(f"{name}: is another subvolume/mount")
-            shutil.rmtree(name, dir_fd=fd)  # fd-based, never follows symlinks
+            _rmtree_at(fd, name, dev)
         else:
             os.unlink(name, dir_fd=fd)
     finally:
         os.close(fd)
 
 
+def _restore_ro(s, fd):
+    """Make the subvolume open as fd read-only again (via its path, for the
+    btrfs command) and verify through fd that it worked."""
+    try:
+        if Subvol(s.path).uuid != s.uuid:
+            raise OSError(f"{s.path} now is a different subvolume")
+        set_ro(s.path, True)
+        if not Subvol(s.path, fd).readonly:
+            raise OSError("still writable after setting ro")
+    except Exception as e:
+        print(f"!!! FAILED to make {s.path} (uuid {s.uuid}) read-only again: {e}\n"
+              f"!!! fix manually: btrfs property set -ts <its path> ro true",
+              file=sys.stderr)
+        raise
+
+
 def delete_in(s, rel):
-    """Delete rel inside subvolume s, making it writable temporarily."""
+    """Delete rel inside subvolume s, making it writable temporarily.
+
+    Works on an fd of the subvolume root, verified to be the planned
+    subvolume (uuid), so a path replaced after planning is never used for
+    deleting. The btrfs command needs a path; the ro flag it sets is verified
+    through the fd before deleting and after restoring."""
     t = os.path.join(s.path, rel)
     m = mount_conflict(s.path, t)  # re-check now, not only at planning time
     if m:
         raise OSError(f"mount point {m} on or below the path")
-    readonly = Subvol(s.path).readonly
+    fd = os.open(s.path, _NOFOLLOW_DIR)
     try:
-        if readonly:
+        cur = Subvol(s.path, fd)
+        if cur.uuid != s.uuid:
+            raise OSError(f"{s.path} is no longer the planned subvolume (uuid changed)")
+        if cur.received_uuid != NULL_UUID:
+            raise OSError(f"{s.path} is a received snapshot")
+        if not cur.readonly:
+            remove_at(fd, rel)
+            return
+        try:
+            if Subvol(s.path).uuid != s.uuid:
+                raise OSError(f"{s.path} is no longer the planned subvolume (uuid changed)")
             set_ro(s.path, False)
-        remove_at(s.path, rel)
+            if Subvol(s.path, fd).readonly:
+                raise OSError(f"{s.path} still read-only after making it writable")
+            remove_at(fd, rel)
+        finally:
+            if not Subvol(s.path, fd).readonly:
+                _restore_ro(s, fd)
     finally:
-        if readonly:
-            try:
-                set_ro(s.path, True)
-            except Exception as e:
-                print(f"!!! FAILED to make {s.path} read-only again: {e}\n"
-                      f"!!! fix manually: btrfs property set -ts {s.path} ro true",
-                      file=sys.stderr)
-                raise
+        os.close(fd)
 
 
 _stop_requested = False

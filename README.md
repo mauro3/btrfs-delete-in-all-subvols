@@ -145,8 +145,11 @@ Delete? [y/N]
   *starting* during the deletion.
 - Deletes through directory file descriptors opened with `O_NOFOLLOW` from
   the subvolume root, checking at each step that it stays on the same
-  subvolume. If a directory on the path is swapped for a symlink between
-  planning and deletion, the deletion fails instead of escaping.
+  subvolume. The root itself is verified by UUID to still be the planned
+  subvolume. If a directory on the path is swapped for a symlink, or the
+  snapshot is replaced, between planning and deletion, the deletion fails
+  instead of escaping. Recursive deletion never descends into another
+  subvolume or mount, even one created after the preview.
 - Skips (and says why):
   - targets that are, contain, or lie below a mount point (bind mounts on the
     same filesystem included, via `/proc/self/mountinfo`; checked again right

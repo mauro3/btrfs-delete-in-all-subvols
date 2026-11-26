@@ -305,9 +305,76 @@ class PurgeTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(outside, "f")))
 
     def test_bad_relative_paths_rejected(self):
-        for rel in ("../x", "me/../../x", "", "/etc/passwd", "me//x"):
-            with self.assertRaises(ValueError, msg=rel):
-                bp.remove_at(self.live, rel)
+        fd = os.open(self.live, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for rel in ("../x", "me/../../x", "", "/etc/passwd", "me//x"):
+                with self.assertRaises(ValueError, msg=rel):
+                    bp.remove_at(fd, rel)
+        finally:
+            os.close(fd)
+
+    def test_mount_conflict_with_root_subvolume(self):
+        # live subvolume mounted at / : mounts below / must still be seen
+        mc = lambda t, mounts: bp.mount_conflict("/", t, mounts)
+        self.assertEqual(mc("/srv/data", ["/", "/srv"]), "/srv")
+        self.assertEqual(mc("/srv", ["/", "/srv/data"]), "/srv/data")
+        self.assertIsNone(mc("/srv/data", ["/", "/home"]))
+
+    def test_replaced_subvolume_not_used(self):
+        # Planned s1; afterwards s1 is renamed away and a new snapshot takes
+        # its path. Nothing may be deleted from either.
+        planned = bp.Subvol(self.snapshot("s1"))
+        os.rename(self.p("snaps/s1"), self.p("snaps/s1.old"))
+        self.snapshot("s1")
+        with self.assertRaisesRegex(OSError, "no longer the planned subvolume"):
+            bp.delete_in(planned, "me/vm/big.img")
+        self.assertTrue(self.exists("snaps/s1/me/vm/big.img"))
+        self.assertTrue(self.exists("snaps/s1.old/me/vm/big.img"))
+        self.assertTrue(bp.Subvol(self.p("snaps/s1")).readonly)
+        self.assertTrue(bp.Subvol(self.p("snaps/s1.old")).readonly)
+
+    def test_replaced_writable_subvolume_not_used(self):
+        # Writable (live) subvolume: only the fd uuid check protects here.
+        planned = bp.Subvol(self.live)
+        os.rename(self.live, self.p("live.old"))
+        btrfs("subvolume", "create", self.live)
+        os.makedirs(self.p("live/me/vm"))
+        self.write("live/me/vm/big.img", 10)
+        with self.assertRaisesRegex(OSError, "no longer the planned subvolume"):
+            bp.delete_in(planned, "me/vm/big.img")
+        self.assertTrue(self.exists("live/me/vm/big.img"))
+        self.assertTrue(self.exists("live.old/me/vm/big.img"))
+
+    def test_rmtree_refuses_entry_swapped_for_symlink(self):
+        # As if a listed directory was replaced by a symlink before being opened.
+        # Target on the same subvolume, so only O_NOFOLLOW (not st_dev) stops it.
+        os.makedirs(self.p("live/precious"))
+        self.write("live/precious/f", 10)
+        os.symlink("../precious", self.p("live/me/swapped"))
+        fd = os.open(self.p("live/me"), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaises(OSError):
+                bp._rmtree_at(fd, "swapped", os.fstat(fd).st_dev)
+        finally:
+            os.close(fd)
+        self.assertTrue(self.exists("live/precious/f"))
+
+    def test_nested_subvolume_created_after_planning_not_traversed(self):
+        s = bp.Subvol(self.live)
+        btrfs("subvolume", "create", self.p("live/me/vm/nested"))
+        self.write("live/me/vm/nested/inner", 10)
+        with self.assertRaisesRegex(OSError, "another subvolume"):
+            bp.delete_in(s, "me/vm")
+        self.assertTrue(self.exists("live/me/vm/nested/inner"))
+
+    def test_rmtree_deletes_deep_tree_with_symlinks(self):
+        os.makedirs(self.p("live/me/vm/a/b/c"))
+        self.write("live/me/vm/a/b/c/f", 10)
+        os.symlink("/etc", self.p("live/me/vm/a/etc"))
+        os.symlink("/etc/passwd", self.p("live/me/vm/a/b/passwd"))
+        bp.delete_in(bp.Subvol(self.live), "me/vm")
+        self.assertFalse(self.exists("live/me/vm"))
+        self.assertTrue(os.path.exists("/etc/passwd"))
 
     def test_mount_conflict(self):
         root = os.path.realpath(self.live)
